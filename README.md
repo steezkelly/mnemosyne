@@ -283,7 +283,7 @@ MIT License — See [LICENSE](LICENSE)
 ## 📞 Support
 
 - **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
-- **Hermes Docs:** [github.com/AxDSan/hermes](https://github.com/AxDSan/hermes)
+- **Hermes Docs:** [hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)
 
 ---
 
