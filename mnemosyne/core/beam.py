@@ -42,8 +42,11 @@ if os.environ.get("MNEMOSYNE_DATA_DIR"):
 
 # Config
 EMBEDDING_DIM = 384  # bge-small-en-v1.5
-WORKING_MEMORY_MAX_ITEMS = 100
-WORKING_MEMORY_TTL_HOURS = 24
+WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
+WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "24"))
+EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
+SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
+SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
 
 
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:
@@ -322,12 +325,12 @@ class BeamMemory:
 
         # ---- Working memory (keyword + recency) ----
         cursor = self.conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT id, content, source, timestamp, importance
             FROM working_memory
             WHERE session_id = ?
             ORDER BY timestamp DESC
-            LIMIT 200
+            LIMIT {EPISODIC_RECALL_LIMIT}
         """, (self.session_id,))
         for row in cursor.fetchall():
             content_lower = row["content"].lower()
@@ -432,12 +435,12 @@ class BeamMemory:
 
     def scratchpad_read(self) -> List[Dict]:
         cursor = self.conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT id, content, created_at, updated_at
             FROM scratchpad
             WHERE session_id = ?
             ORDER BY updated_at DESC
-            LIMIT 50
+            LIMIT {SCRATCHPAD_MAX_ITEMS}
         """, (self.session_id,))
         return [dict(row) for row in cursor.fetchall()]
 
@@ -458,12 +461,12 @@ class BeamMemory:
         cursor = self.conn.cursor()
         # Find working memories older than TTL/2 that haven't been consolidated
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT id, content, source, timestamp, importance, metadata_json
             FROM working_memory
             WHERE session_id = ? AND timestamp < ?
             ORDER BY timestamp ASC
-            LIMIT 20
+            LIMIT {SLEEP_BATCH_SIZE}
         """, (self.session_id, cutoff))
         rows = cursor.fetchall()
         if not rows:
