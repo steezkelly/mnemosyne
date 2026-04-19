@@ -731,9 +731,12 @@ class BeamMemory:
     def sleep(self, dry_run: bool = False) -> Dict:
         """
         Consolidate old working_memory into episodic_memory summaries.
+        Uses a local lightweight LLM when available; falls back to aaak
+        compression if the model is missing or inference fails.
         Returns summary of what was done.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
+        from mnemosyne.core import local_llm
 
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
@@ -754,19 +757,35 @@ class BeamMemory:
 
         consolidated_ids = []
         summaries_created = 0
+        llm_used_count = 0
         for source, items in grouped.items():
             lines = [item["content"] for item in items]
-            combined = " | ".join(lines)
-            compressed = aaak_encode(combined)
-            summary = f"[{source}] {compressed}"
             ids = [item["id"] for item in items]
+
+            # --- Try local LLM summarization first ---
+            summary = None
+            if local_llm.llm_available():
+                summary = local_llm.summarize_memories(lines, source=source)
+                if summary:
+                    llm_used_count += 1
+
+            # --- Fallback to aaak encoding ---
+            if summary is None:
+                combined = " | ".join(lines)
+                compressed = aaak_encode(combined)
+                summary = f"[{source}] {compressed}"
+
             if not dry_run:
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
                     source="sleep_consolidation",
                     importance=0.6,
-                    metadata={"original_count": len(items), "source": source}
+                    metadata={
+                        "original_count": len(items),
+                        "source": source,
+                        "llm_used": summary != f"[{source}] {aaak_encode(' | '.join(lines))}"
+                    }
                 )
                 placeholders = ",".join("?" * len(ids))
                 cursor.execute(f"DELETE FROM working_memory WHERE id IN ({placeholders})", ids)
@@ -774,17 +793,20 @@ class BeamMemory:
             consolidated_ids.extend(ids)
             summaries_created += 1
 
+        method = "llm" if llm_used_count == summaries_created else ("llm+aaak" if llm_used_count > 0 else "aaak")
         if not dry_run:
             cursor.execute("""
                 INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview)
                 VALUES (?, ?, ?)
-            """, (self.session_id, len(consolidated_ids), f"{summaries_created} summaries from {len(consolidated_ids)} items"))
+            """, (self.session_id, len(consolidated_ids), f"{summaries_created} summaries ({method}) from {len(consolidated_ids)} items"))
             self.conn.commit()
 
         return {
             "status": "dry_run" if dry_run else "consolidated",
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
+            "llm_used": llm_used_count,
+            "method": method,
             "consolidated_ids": consolidated_ids
         }
 
