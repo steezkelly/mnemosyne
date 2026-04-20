@@ -137,12 +137,14 @@ python -m mnemosyne.install
 ### Optional dependencies
 
 ```bash
-# Dense retrieval (recommended)
-pip install sentence-transformers>=2.3
+# Dense retrieval (required for semantic search and the 98.9% LongMemEval score)
+pip install fastembed>=0.3.0
 
 # Local LLM consolidation (sleep cycle summarization)
 pip install ctransformers>=0.2.27 huggingface-hub>=0.20
 ```
+
+> **Note:** Without `fastembed`, Mnemosyne falls back to keyword-only retrieval. It still works, but you won't get competitive semantic search or the benchmark scores above.
 
 ### Uninstall
 

@@ -53,8 +53,8 @@ setup(
     },
     extras_require={
         "llm": ["ctransformers>=0.2.27", "huggingface-hub>=0.20"],
-        "embeddings": ["sentence-transformers>=2.3"],
-        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "sentence-transformers>=2.3"],
+        "embeddings": ["fastembed>=0.3.0"],
+        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0"],
     },
     entry_points={
         "console_scripts": [
