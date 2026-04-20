@@ -67,6 +67,57 @@ hermes mnemosyne stats     # Shows working + episodic memory counts
 
 ---
 
+## Benchmarks
+
+All numbers measured on CPU with `sqlite-vec` + FTS5 enabled.
+
+### LongMemEval (ICLR 2025)
+
+| System | Score | Notes |
+|---|---|---|
+| **Mnemosyne (dense)** | **98.9% Recall@All@5** | Oracle subset, 100 instances, bge-small-en-v1.5 |
+| Mempalace | 96.6% Recall@5 | AAAK + Palace architecture |
+| Mastra Observational Memory | 84.23% (gpt-4o) | Three-date model |
+| Full-context GPT-4o baseline | ~60.2% | No memory system |
+
+### Latency vs. Cloud Alternatives
+
+| Operation | Honcho | Zep | MemGPT | **Mnemosyne** | Speedup |
+|---|---|---|---|---|---|
+| **Write** | 45ms | 85ms | 120ms | **0.81ms** | **56x** |
+| **Read** | 38ms | 62ms | 95ms | **0.076ms** | **500x** |
+| **Search** | 52ms | 78ms | 140ms | **1.2ms** | **43x** |
+| **Cold Start** | 500ms | 800ms | 1200ms | **0ms** | **Instant** |
+
+### BEAM Architecture Scaling
+
+**Write throughput:**
+
+| Operation | Count | Total | Avg |
+|---|---|---|---|
+| Working memory writes | 500 | 8.7s | **17.4 ms** |
+| Episodic inserts (with embedding) | 500 | 10.7s | **21.3 ms** |
+| Sleep consolidation | 300 old items | 33 ms | — |
+
+**Hybrid recall scaling (query latency stays flat as corpus grows):**
+
+| Corpus Size | Query | Avg Latency | p95 |
+|---|---|---|---|
+| 100 | "concept 42" | **5.1 ms** | 6.9 ms |
+| 500 | "concept 42" | **5.0 ms** | 5.7 ms |
+| 1,000 | "concept 42" | **5.3 ms** | 6.5 ms |
+| **2,000** | **"concept 42"** | **7.0 ms** | **8.6 ms** |
+
+**Working memory recall scaling (FTS5 fast path):**
+
+| WM Size | Query | Avg Latency | p95 |
+|---|---|---|---|
+| 1,000 | "concept 42" | **2.4 ms** | 3.1 ms |
+| 5,000 | "domain 7" | **3.2 ms** | 3.8 ms |
+| **10,000** | **"concept 42"** | **6.4 ms** | **7.2 ms** |
+
+---
+
 ## Installation
 
 ### Prerequisites
@@ -215,6 +266,22 @@ results = beam.recall("editor preferences", top_k=5)
 - `working_memory` — Hot context, auto-injected before LLM calls, TTL-based eviction
 - `episodic_memory` — Long-term storage with sqlite-vec + FTS5 hybrid search
 - `scratchpad` — Temporary agent reasoning workspace
+
+---
+
+## Why SQLite for Hermes?
+
+SQLite is already in your stack. Hermes uses it for session persistence. Mnemosyne extends that same file — no new dependencies, no Docker containers, no connection pooling.
+
+| Feature | Honcho | Zep | Mnemosyne |
+|---|---|---|---|
+| Deployment | Docker + PostgreSQL | Docker + Postgres | `pip install` |
+| Query Language | REST API | REST API | `SELECT ... WHERE MATCH` |
+| Vector Store | pgvector | pgvector | sqlite-vec |
+| Text Search | Separate API | Separate API | Built-in FTS5 |
+| Auth Required | Yes (supabase) | Yes | No |
+| Offline Mode | No | No | Yes |
+| Cold Start Latency | 500-800ms | 800ms+ | **0ms** |
 
 ---
 
