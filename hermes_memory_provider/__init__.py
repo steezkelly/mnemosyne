@@ -299,8 +299,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if not self._beam:
-            return []
+        """Return tool schemas — static, do not depend on initialization state."""
         return list(ALL_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
