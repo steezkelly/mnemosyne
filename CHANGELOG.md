@@ -8,6 +8,15 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.7
+
+- Fix subagent context writes polluting persistent memory (PR #8 by @woaim65)
+- Fix cross-session recall inconsistency: global memories now survive consolidation with scope preserved
+- Fix fallback keyword scoring for Chinese and spaceless languages (character-level overlap)
+- Fix episodic memory having no fallback scan when vector search and FTS5 both miss
+- Fix plugin tools singleton using stale session_id across sessions
+- Add regression tests: subagent context safety, cross-session recall, Chinese substring matching, session singleton updates
+
 ## 1.6
 
 - Feature request issue template
