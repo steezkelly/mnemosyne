@@ -427,3 +427,19 @@ def register_memory_provider(ctx):
     """Called by Hermes memory provider discovery system."""
     provider = MnemosyneMemoryProvider()
     ctx.register_memory_provider(provider)
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration (used when loaded via Hermes plugin system)
+# ---------------------------------------------------------------------------
+
+def register(ctx):
+    """Called by Hermes plugin loader to register CLI commands and tools."""
+    from .cli import register_cli, mnemosyne_command
+    ctx.register_cli_command(
+        name="mnemosyne",
+        help="Manage Mnemosyne local memory",
+        description="Inspect, consolidate, and manage Mnemosyne native memory.",
+        setup_fn=register_cli,
+        handler_fn=mnemosyne_command,
+    )
