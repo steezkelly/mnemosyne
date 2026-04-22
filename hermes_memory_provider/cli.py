@@ -16,12 +16,7 @@ if str(_mnemosyne_root) not in sys.path:
 
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
-    mnemosyne_parser = subparser.add_parser(
-        "mnemosyne",
-        help="Manage Mnemosyne local memory",
-        description="Inspect, consolidate, and manage Mnemosyne native memory.",
-    )
-    mn_cmds = mnemosyne_parser.add_subparsers(dest="mnemosyne_cmd")
+    mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
 
     mn_cmds.add_parser("stats", help="Show memory statistics")
     mn_cmds.add_parser("sleep", help="Run consolidation cycle")
@@ -40,7 +35,7 @@ def register_cli(subparser):
     import_cmd.add_argument("--input", "-i", type=str, required=True, help="Input JSON file path")
     import_cmd.add_argument("--force", action="store_true", help="Overwrite existing records")
 
-    mnemosyne_parser.set_defaults(func=mnemosyne_command)
+    subparser.set_defaults(func=mnemosyne_command)
 
 
 def mnemosyne_command(args):
