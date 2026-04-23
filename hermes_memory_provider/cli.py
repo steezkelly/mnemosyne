@@ -18,7 +18,9 @@ def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
     mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
 
-    mn_cmds.add_parser("stats", help="Show memory statistics")
+    stats_cmd = mn_cmds.add_parser("stats", help="Show memory statistics")
+    stats_cmd.add_argument("--global", "-g", action="store_true", help="Show global stats across all sessions")
+
     mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
@@ -53,7 +55,10 @@ def mnemosyne_command(args):
         return 1
 
     if cmd == "stats":
-        working = beam.get_working_stats()
+        if getattr(args, "global", False):
+            working = beam.get_global_working_stats()
+        else:
+            working = beam.get_working_stats()
         episodic = beam.get_episodic_stats()
         print(json.dumps({"working": working, "episodic": episodic}, indent=2))
 

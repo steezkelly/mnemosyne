@@ -541,6 +541,16 @@ class BeamMemory:
         last = cursor.fetchone()
         return {"total": total, "last": last[0] if last else None}
 
+    def get_global_working_stats(self) -> Dict:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM working_memory")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT timestamp FROM working_memory ORDER BY timestamp DESC LIMIT 1")
+        last = cursor.fetchone()
+        cursor.execute("SELECT COUNT(DISTINCT session_id) FROM working_memory")
+        sessions = cursor.fetchone()[0]
+        return {"total": total, "last": last[0] if last else None, "sessions": sessions}
+
     def forget_working(self, memory_id: str) -> bool:
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM working_memory WHERE id = ? AND session_id = ?", (memory_id, self.session_id))

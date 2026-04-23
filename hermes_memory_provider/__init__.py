@@ -95,8 +95,13 @@ SLEEP_SCHEMA = {
 
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
-    "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
-    "parameters": {"type": "object", "properties": {}},
+    "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers. Use global=true to see stats across all sessions.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "global": {"type": "boolean", "description": "Show global stats across all sessions instead of current session only.", "default": False}
+        }
+    },
 }
 
 INVALIDATE_SCHEMA = {
@@ -358,7 +363,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return json.dumps({"status": "consolidated", "working": working, "episodic": episodic})
 
     def _handle_stats(self, args: Dict[str, Any]) -> str:
-        working = self._beam.get_working_stats()
+        if args.get("global", False):
+            working = self._beam.get_global_working_stats()
+        else:
+            working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         return json.dumps({"provider": "mnemosyne", "session_id": self._session_id, "working": working, "episodic": episodic})
 

@@ -231,8 +231,11 @@ See [UPDATING.md](UPDATING.md) for detailed troubleshooting and rollback instruc
 ### CLI
 
 ```bash
-# Show memory statistics
+# Show memory statistics (current session only)
 hermes mnemosyne stats
+
+# Show memory statistics across ALL sessions
+hermes mnemosyne stats --global
 
 # Search memories
 hermes mnemosyne inspect "dark mode preferences"

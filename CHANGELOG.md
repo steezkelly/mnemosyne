@@ -8,6 +8,12 @@ given a version number **MAJOR.MINOR**, increment the:
 
 ---
 
+## 1.10.0
+
+- **`hermes mnemosyne stats --global`** — Show working memory stats across all sessions (not just current session). Adds `sessions` count to output.
+- **`mnemosyne_stats(global=true)`** — MemoryProvider tool also supports global stats.
+- Internal: added `BeamMemory.get_global_working_stats()` for global working memory aggregation.
+
 ## 1.9.0
 
 - **PyPI release** — `pip install mnemosyne-memory` is now live: https://pypi.org/project/mnemosyne-memory/
