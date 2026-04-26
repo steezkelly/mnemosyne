@@ -1,0 +1,116 @@
+# Hermes Integration
+
+Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework](https://github.com/NousResearch/hermes-agent). It implements the Hermes `MemoryProvider` interface and registers as a plugin.
+
+## Setup
+
+### Step 1: Install
+
+```bash
+pip install mnemosyne-memory
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/AxDSan/mnemosyne.git
+cd mnemosyne
+pip install -e ".[all,dev]"
+```
+
+### Step 2: Register with Hermes
+
+```bash
+python -m mnemosyne.install
+```
+
+This creates a plugin entry at `~/.hermes/plugins/mnemosyne/` and wires up the MemoryProvider.
+
+### Step 3: Activate
+
+```bash
+hermes memory setup
+# Select "mnemosyne" from the picker and press Enter
+```
+
+### Step 4: Verify
+
+```bash
+hermes memory status       # Should show "Provider: mnemosyne"
+hermes mnemosyne stats     # Working + episodic memory counts
+```
+
+## How It Works
+
+Mnemosyne hooks into the Hermes agent lifecycle:
+
+| Hook | Behavior |
+|---|---|
+| `pre_llm_call` | Injects relevant working memory context into the prompt |
+| `on_session_start` | Initializes session-scoped memory state |
+| `post_tool_call` | Captures tool results as memories (if configured) |
+
+### Registered Tools
+
+Mnemosyne registers these tools in the Hermes tool registry:
+
+| Tool | Description |
+|---|---|
+| `mnemosyne_remember` | Store a memory |
+| `mnemosyne_recall` | Search memories |
+| `mnemosyne_stats` | Show memory statistics |
+| `mnemosyne_triple_add` | Add a knowledge graph triple |
+| `mnemosyne_triple_query` | Query the knowledge graph |
+| `mnemosyne_sleep` | Run consolidation |
+| `mnemosyne_scratchpad_write` | Write to scratchpad |
+| `mnemosyne_scratchpad_read` | Read scratchpad |
+| `mnemosyne_scratchpad_clear` | Clear scratchpad |
+| `mnemosyne_update` | Update a memory by ID |
+| `mnemosyne_forget` | Delete a memory by ID |
+| `mnemosyne_invalidate` | Mark a memory as superseded |
+| `mnemosyne_export` | Export all memories to JSON |
+| `mnemosyne_import` | Import memories from JSON |
+
+## CLI Commands
+
+```bash
+hermes mnemosyne stats              # Current session stats
+hermes mnemosyne stats --global     # Stats across all sessions
+hermes mnemosyne inspect "query"    # Search memories
+hermes mnemosyne sleep              # Run consolidation
+hermes mnemosyne export --output backup.json
+hermes mnemosyne import --input backup.json
+hermes mnemosyne clear              # Clear scratchpad
+hermes mnemosyne version            # Show version
+```
+
+## Data Location
+
+All data is stored in:
+
+```
+~/.hermes/mnemosyne/
+├── data/
+│   ├── mnemosyne.db    # Main SQLite database (BEAM + legacy)
+│   └── triples.db      # Knowledge graph (same directory)
+└── ...
+```
+
+This path is chosen because Hermes already persists `~/.hermes/` across sessions (including on ephemeral VMs like Fly.io).
+
+## Optional REST API
+
+For integration with non-Python services:
+
+```bash
+python mnemosyne/cli.py server  # Runs on http://localhost:8090
+```
+
+This is entirely optional — the core library works without it.
+
+## Uninstall
+
+```bash
+python -m mnemosyne.install --uninstall
+hermes memory setup              # Switch back to built-in memory
+```

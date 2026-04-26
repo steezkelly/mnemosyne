@@ -46,7 +46,7 @@ dev = ["pytest>=7.0", "build", "twine"]
 Homepage = "https://github.com/AxDSan/mnemosyne"
 Repository = "https://github.com/AxDSan/mnemosyne"
 Issues = "https://github.com/AxDSan/mnemosyne/issues"
-Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/README.md"
+Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md"
 
 [project.scripts]
 mnemosyne-install = "mnemosyne.install:install"

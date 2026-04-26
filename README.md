@@ -477,6 +477,19 @@ Mnemosyne publishes [GitHub Releases](https://github.com/AxDSan/mnemosyne/releas
 
 ---
 
+## Documentation
+
+Full documentation is in the [`docs/`](docs/README.md) directory:
+
+- [Getting Started](docs/getting-started.md) — Installation, quickstart, first memory
+- [Architecture](docs/architecture.md) — BEAM tiers, SQLite backend, hybrid search
+- [API Reference](docs/api-reference.md) — Python API: `remember`, `recall`, `sleep`, triples
+- [Hermes Integration](docs/hermes-integration.md) — Using as a Hermes memory backend
+- [Configuration](docs/configuration.md) — Environment variables, vector compression, LLM setup
+- [Changelog](docs/changelog.md) — Release history
+
+---
+
 ## Contributing
 
 Contributions are welcome. Areas of active interest:
