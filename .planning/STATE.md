@@ -2,9 +2,45 @@
 
 ## Current Position
 
-**Phase:** 0 (Foundation)
-**Status:** Planning Complete — Ready to Execute
+**Phase:** 1 (Entity Sketching) — **DONE, not yet shipped**
+**Phase 2:** Structured Extract — **In Progress**
 **Last Updated:** 2026-04-28
+
+## Completed Work (Unshipped)
+
+| Item | Date | Status |
+|---|---|---|
+| Phase 1: Entity Sketching | 2026-04-28 | Code complete, tests passing, docs draft |
+| FastEmbed cache persistence fix | 2026-04-28 | cbcf6f4 |
+| Docs overhaul (honest comparison) | 2026-04-28 | b00952e |
+| PlanForge project initialization | 2026-04-28 | 65e4b3f |
+
+## Phase 1 Completion Summary
+
+- **32 unit tests** passing (`test_entities.py`)
+- **8 integration tests** passing (`test_entity_integration.py`)
+- **Performance verified:** <5ms extraction overhead
+- **API changes:** `remember(extract_entities=True)` — backward compatible, default False
+- **No breaking changes** to existing API
+
+## In Progress
+
+| Item | Phase | Status |
+|---|---|---|
+| Structured Memory Extract | 2 | Planning complete, ready to implement |
+
+## Shipping Strategy
+
+**All docs and integration updates deferred to Phase 13 (Final Shipping Phase).**
+- Phase 1–12: Pure feature development, no docs updates
+- Phase 13: All docs, benchmarks, comparison page, README, API reference — ship together as major release
+- This prevents fragmented messaging and ensures cohesive narrative
+
+## Next Actions
+
+1. **Phase 2: Structured Extract** — Begin implementation of REQ-2
+2. Create `2-STRUCTURED-EXTRACT-SPEC.md` with detailed implementation plan
+3. Create `2-STRUCTURED-EXTRACT-PLAN.md` with atomic tasks
 
 ## Completed Work
 

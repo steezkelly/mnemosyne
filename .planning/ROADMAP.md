@@ -26,8 +26,13 @@ title: PlanForge — Mnemosyne Competitive Enhancement
 | **4** | Configurable Scoring | User-tunable hybrid weights | Low | 1 session |
 | **5** | Memory Banks | Named namespace isolation within SQLite | Medium | 2 sessions |
 | **6** | MCP Server | Model Context Protocol for cross-agent sharing | High | 3-4 sessions |
-| **7** | Integration | Hermes plugin updates, docs, benchmarks | Medium | 2-3 sessions |
-| **8** | v2 Differentiation | Streaming, compression, pattern consolidation, delta sync, health CLI, plugin retrievers | High | 4-6 sessions |
+| **7** | **Structured Extract** | REQ-2: LLM-driven fact extraction as derived layer | Medium | 2-3 sessions |
+| **8** | **Temporal Recall** | REQ-3: Time-aware scoring boost | Low | 1-2 sessions |
+| **9** | **Configurable Scoring** | REQ-5: User-tunable hybrid weights | Low | 1 session |
+| **10** | **Memory Banks** | REQ-6: Named namespace isolation | Medium | 2 sessions |
+| **11** | **MCP Server** | REQ-4: Model Context Protocol for cross-agent sharing | High | 3-4 sessions |
+| **12** | **v2 Differentiation** | REQ-7 through REQ-12: Streaming, compression, pattern consolidation, delta sync, health CLI, plugin retrievers | High | 4-6 sessions |
+| **13** | **Integration & Docs** | Hermes plugin updates, benchmarks, API docs, comparison page, README — **all docs ship together** | Medium | 2-3 sessions |
 
 ## Phase Locking Rules
 
