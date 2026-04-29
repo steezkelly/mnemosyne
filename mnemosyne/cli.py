@@ -620,7 +620,15 @@ def run_cli():
 
     elif command == "server":
         run_server()
-    
+
+    elif command == "mcp":
+        try:
+            from mnemosyne.mcp_server import main as mcp_main
+            mcp_main()
+        except ImportError:
+            print("❌ MCP not available. Install with: pip install mnemosyne-memory[mcp]")
+            sys.exit(1)
+
     else:
         print(f"❌ Unknown command: {command}")
 

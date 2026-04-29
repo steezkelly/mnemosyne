@@ -36,3 +36,12 @@ def __getattr__(name: str):
     raise AttributeError(f"module 'mnemosyne' has no attribute '{name}'")
 
 __all__ = list(_lazy_exports.keys())
+
+# Conditionally expose MCP server if mcp package is installed
+try:
+    import mcp
+    from mnemosyne.mcp_server import run_mcp_server
+    _lazy_exports["run_mcp_server"] = (".mcp_server", "run_mcp_server")
+    __all__.append("run_mcp_server")
+except ImportError:
+    pass  # MCP is optional — core works without it

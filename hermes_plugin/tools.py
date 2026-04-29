@@ -53,7 +53,7 @@ REMEMBER_SCHEMA = {
 
 RECALL_SCHEMA = {
     "name": "mnemosyne_recall",
-    "description": "Search memories in Mnemosyne. Uses hybrid vector + full-text search across working and episodic memory.",
+    "description": "Search memories in Mnemosyne. Uses hybrid vector + full-text search across working and episodic memory. Supports temporal weighting to boost recent memories.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -65,10 +65,25 @@ RECALL_SCHEMA = {
                 "type": "integer",
                 "description": "Number of results to return",
                 "default": 5
-            }
+            },
+            "temporal_weight": {
+                "type": "number",
+                "description": "How much to boost recent memories (0.0 = ignore time, 0.2 = mild recency bias, 0.5 = strong recency bias). Default 0.0 for backward compatibility.",
+                "default": 0.0
+            },
+            "query_time": {
+                "type": "string",
+                "description": "ISO timestamp to treat as 'now' for temporal scoring (e.g., '2026-04-28T12:00:00'). Default is current time.",
+                "default": None
+            },
+            "temporal_halflife": {
+                "type": "number",
+                "description": "Hours until temporal boost decays by half. Default 24. Lower = faster decay.",
+                "default": 24,
+            },
         },
-        "required": ["query"]
-    }
+        "required": ["query"],
+    },
 }
 
 STATS_SCHEMA = {
@@ -304,16 +319,26 @@ def mnemosyne_recall(args: dict, **kwargs) -> str:
     try:
         query = args.get("query", "").strip()
         top_k = args.get("top_k", 5)
+        temporal_weight = args.get("temporal_weight", 0.0)
+        query_time = args.get("query_time")
+        temporal_halflife_hours = args.get("temporal_halflife", 24)
 
         if not query:
             return json.dumps({"error": "Query is required"})
 
         mem = _get_memory()
-        results = mem.recall(query, top_k=top_k)
+        results = mem.recall(
+            query, top_k=top_k,
+            temporal_weight=temporal_weight,
+            query_time=query_time,
+            temporal_halflife=temporal_halflife_hours
+        )
 
         return json.dumps({
             "query": query,
             "results_count": len(results),
+            "temporal_weight": temporal_weight,
+            "query_time": query_time,
             "results": results
         })
 

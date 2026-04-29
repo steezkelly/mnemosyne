@@ -9,7 +9,7 @@ from mnemosyne import remember, recall, get_stats, forget, update, sleep
 from mnemosyne import get_context, scratchpad_write, scratchpad_read, scratchpad_clear
 ```
 
-### `remember(content, *, source, importance, metadata, valid_until, scope)`
+### `remember(content, *, source, importance, metadata, valid_until, scope, extract_entities)`
 
 Store a memory. Writes to both BEAM working memory and the legacy table.
 
@@ -21,6 +21,7 @@ remember(
     metadata={"ui": "v2"},     # default: None
     valid_until="2026-12-31",  # default: None (never expires)
     scope="global",            # "session" (default) or "global"
+    extract_entities=True,     # default: False — see Entity Sketching below
 )
 # → returns memory_id (str)
 ```
@@ -35,6 +36,7 @@ remember(
 | `metadata` | `dict` | `None` | Arbitrary JSON-serializable metadata |
 | `valid_until` | `str` | `None` | ISO 8601 datetime. Memory expires after this time. |
 | `scope` | `str` | `"session"` | `"session"` = current session only, `"global"` = all sessions |
+| `extract_entities` | `bool` | `False` | Extract entities and store as triples for fuzzy recall |
 
 ---
 
@@ -159,7 +161,7 @@ Mnemosyne(session_id="default", db_path=None)
 
 | Method | Signature | Description |
 |---|---|---|
-| `remember` | `(content, source, importance, metadata, valid_until, scope) → str` | Store a memory |
+| `remember` | `(content, source, importance, metadata, valid_until, scope, extract_entities) → str` | Store a memory |
 | `recall` | `(query, top_k=5) → List[Dict]` | Search memories |
 | `get_context` | `(limit=10) → List[Dict]` | Get recent working memory entries |
 | `get_stats` | `() → Dict` | Get statistics |
@@ -240,5 +242,56 @@ all_triples = kg.export_all()
 |---|---|
 | `add(subject, predicate, object, valid_from, source, confidence) → int` | Add a temporal triple |
 | `query(subject, predicate, object, as_of) → List[Dict]` | Query triples, optionally at a point in time |
+| `query_by_predicate(predicate, object, subject) → List[Dict]` | Query triples by predicate (entity sketching helper) |
+| `get_distinct_objects(predicate) → List[str]` | Get all distinct object values for a predicate |
 | `invalidate(triple_id) → bool` | Mark a triple as no longer valid |
 | `export_all() → List[Dict]` | Export all triples |
+
+---
+
+## Entity Sketching
+
+Lightweight entity extraction and fuzzy matching without heavy NLP dependencies.
+
+```python
+from mnemosyne.core.entities import extract_entities_regex, find_similar_entities
+
+# Extract entities from text
+entities = extract_entities_regex("Abdias and Maya work on Mnemosyne in New York.")
+# → ['Abdias', 'Maya', 'Mnemosyne', 'New York']
+
+# Find similar entities in a known list
+known = ["Abdias", "Abdias J.", "Maya", "Mnemosyne"]
+similar = find_similar_entities("Abdias Moya", known, threshold=0.8)
+# → [('Abdias', 0.9), ('Abdias J.', 0.85)]
+```
+
+### Functions
+
+| Function | Signature | Description |
+|---|---|---|
+| `extract_entities_regex` | `(text: str) → List[str]` | Extract entities using regex patterns |
+| `find_similar_entities` | `(entity, known_entities, threshold=0.8) → List[Tuple[str, float]]` | Fuzzy match entity against known list |
+| `similarity` | `(s1: str, s2: str) → float` | Entity-aware similarity (1.0 = identical) |
+| `levenshtein_distance` | `(s1: str, s2: str) → int` | Pure Python edit distance |
+
+### Usage with `remember()`
+
+Enable entity extraction on a per-memory basis:
+
+```python
+from mnemosyne import remember, recall
+
+# Store with entity extraction
+remember("Abdias presented at PyCon 2025", extract_entities=True)
+
+# Recall will include entity matches in results
+results = recall("Abdias")
+# Results tagged with entity_match=True for direct entity hits
+```
+
+**Performance:** Entity extraction adds ~0.01ms per call. Triple storage adds ~1ms per entity. Total overhead for a typical memory with 4 entities: ~5ms.
+
+**Storage format:** Entities stored as triples: `(memory_id, "mentions", "Entity Name")`.
+
+---

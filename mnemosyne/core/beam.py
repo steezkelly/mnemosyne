@@ -20,7 +20,7 @@ import threading
 import math
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Set
+from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
 
 from mnemosyne.core import embeddings as _embeddings
@@ -284,14 +284,83 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old."""
     if not timestamp_str:
         return 0.5  # Unknown age = neutral
+def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
+    """Exponential decay based on age."""
     try:
-        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=None)
-        hours_old = max(0.0, (datetime.now() - ts).total_seconds() / 3600.0)
-        return math.exp(-hours_old / halflife_hours)
+        ts = datetime.fromisoformat(timestamp_str)
+        age_hours = (datetime.now() - ts).total_seconds() / 3600.0
+        return math.exp(-age_hours / halflife_hours)
     except Exception:
         return 0.5
+
+
+def _parse_query_time(query_time: Optional[Union[str, datetime]]) -> datetime:
+    """Parse query_time parameter into a datetime object.
+
+    - None -> datetime.now()
+    - str  -> parsed from ISO format
+    - datetime -> returned as-is
+    """
+    if query_time is None:
+        return datetime.now()
+    if isinstance(query_time, datetime):
+        return query_time
+    if isinstance(query_time, str):
+        # Try ISO format with various precisions
+        try:
+            return datetime.fromisoformat(query_time)
+        except ValueError:
+            # Try appending time if only date provided
+            try:
+                return datetime.fromisoformat(f"{query_time}T00:00:00")
+            except ValueError:
+                raise ValueError(f"Invalid query_time format: {query_time!r}. Expected ISO datetime string.")
+    raise TypeError(f"query_time must be str, datetime, or None; got {type(query_time).__name__}")
+
+
+# Fast-path timestamp parsing cache
+_TS_CACHE: Dict[str, datetime] = {}
+_TS_CACHE_MAX = 2000
+
+
+def _parse_ts_fast(ts: str) -> Optional[datetime]:
+    """Parse ISO timestamp with LRU-style cache for performance."""
+    if not ts:
+        return None
+    cached = _TS_CACHE.get(ts)
+    if cached is not None:
+        return cached
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if len(_TS_CACHE) >= _TS_CACHE_MAX:
+        _TS_CACHE.clear()
+    _TS_CACHE[ts] = dt
+    return dt
+
+
+def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
+                    halflife_hours: float = 24.0) -> float:
+    """Temporal boost factor based on proximity to query_time.
+
+    Formula: exp(-hours_delta / halflife)
+    - memory at query_time -> boost = 1.0
+    - memory 1 halflife away -> boost = exp(-1) ≈ 0.368
+    - memory 3 halflives away -> boost = exp(-3) ≈ 0.050
+
+    Returns 0.0 for invalid timestamps or future timestamps (clamped to now).
+    """
+    ts = _parse_ts_fast(memory_timestamp_str)
+    if ts is None:
+        return 0.0
+
+    # Clamp future timestamps to query_time (no negative deltas)
+    if ts > query_time:
+        ts = query_time
+
+    hours_delta = (query_time - ts).total_seconds() / 3600.0
+    return math.exp(-hours_delta / halflife_hours)
 
 
 def _vec_available(conn: sqlite3.Connection) -> bool:
@@ -818,7 +887,12 @@ class BeamMemory:
         self.conn.commit()
         return memory_id
 
-    def recall(self, query: str, top_k: int = 5, *, from_date: Optional[str] = None, to_date: Optional[str] = None, source: Optional[str] = None, topic: Optional[str] = None) -> List[Dict]:
+    def recall(self, query: str, top_k: int = 5, *,
+               from_date: Optional[str] = None, to_date: Optional[str] = None,
+               source: Optional[str] = None, topic: Optional[str] = None,
+               temporal_weight: float = 0.0,
+               query_time: Optional[Any] = None,
+               temporal_halflife: Optional[float] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -828,10 +902,26 @@ class BeamMemory:
             from_date/to_date: ISO date strings (YYYY-MM-DD) to filter by timestamp.
             source: Filter by memory source (e.g., 'cron', 'user', 'conversation').
             topic: Filter by topic tag (stored in source field for now, pending dedicated column).
+
+        Temporal scoring (NEW in Phase 3):
+            temporal_weight: Float 0.0-1.0. Soft boost for memories near query_time.
+                0.0 = no temporal boost (default, backward compatible).
+                0.3 = moderate preference for memories near query_time.
+            query_time: Target time for temporal scoring. None = now().
+                Accepts ISO string or datetime object.
+            temporal_halflife: Hours for temporal decay. None = env var or 24h default.
+                Lower = sharper time preference. Higher = broader time window.
         """
         results = []
         query_lower = query.lower()
         query_words = query_lower.split()
+
+        # ---- Temporal scoring setup ----
+        parsed_query_time = _parse_query_time(query_time)
+        if temporal_halflife is not None:
+            th_halflife = temporal_halflife
+        else:
+            th_halflife = float(os.environ.get("MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS", "24"))
 
         # ---- Working memory (FTS5 fast path) ----
         try:
@@ -920,6 +1010,10 @@ class BeamMemory:
                 decay = _recency_decay(row["timestamp"])
                 base_score = relevance * 0.35 + row["importance"] * 0.2
                 score = base_score * (0.7 + 0.3 * decay)
+                # Temporal boost (Phase 3)
+                if temporal_weight > 0.0:
+                    t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                    score *= (1.0 + temporal_weight * t_boost)
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -966,6 +1060,10 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    # Temporal boost (Phase 3)
+                    if temporal_weight > 0.0:
+                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                        score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -1009,6 +1107,10 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    # Temporal boost (Phase 3)
+                    if temporal_weight > 0.0:
+                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                        score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -1054,6 +1156,10 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    # Temporal boost (Phase 3)
+                    if temporal_weight > 0.0:
+                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                        score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -1096,6 +1202,10 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    # Temporal boost (Phase 3)
+                    if temporal_weight > 0.0:
+                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                        score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],
@@ -1184,6 +1294,10 @@ class BeamMemory:
                 decay = _recency_decay(row["timestamp"])
                 base_score = sim * 0.5 + fts * 0.3 + row["importance"] * 0.2
                 score = base_score * (0.7 + 0.3 * decay)
+                # Temporal boost (Phase 3)
+                if temporal_weight > 0.0:
+                    t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                    score *= (1.0 + temporal_weight * t_boost)
                 results.append({
                     "id": row["id"],
                     "content": row["content"][:500],
@@ -1230,6 +1344,10 @@ class BeamMemory:
                     decay = _recency_decay(row["timestamp"])
                     base_score = relevance * 0.35 + row["importance"] * 0.2
                     score = base_score * (0.7 + 0.3 * decay)
+                    # Temporal boost (Phase 3)
+                    if temporal_weight > 0.0:
+                        t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
+                        score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
                         "content": row["content"][:500],

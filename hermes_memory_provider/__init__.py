@@ -53,7 +53,8 @@ REMEMBER_SCHEMA = {
         "insight, or context that should persist across sessions. Higher importance "
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
-        "(ISO date YYYY-MM-DD) for time-bound facts."
+        "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
+        "extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match)."
     ),
     "parameters": {
         "type": "object",
@@ -63,6 +64,7 @@ REMEMBER_SCHEMA = {
             "source": {"type": "string", "description": "Source tag: preference, fact, insight, task, etc.", "default": "user"},
             "scope": {"type": "string", "description": "'session' (default) or 'global'.", "default": "session"},
             "valid_until": {"type": "string", "description": "Optional expiry date YYYY-MM-DD.", "default": ""},
+            "extract_entities": {"type": "boolean", "description": "Extract named entities for fuzzy recall. Default False.", "default": False},
         },
         "required": ["content"],
     },
@@ -72,13 +74,29 @@ RECALL_SCHEMA = {
     "name": "mnemosyne_recall",
     "description": (
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: 50% vector "
-        "similarity + 30% FTS5 text rank + 20% importance. Returns ranked results."
+        "similarity + 30% FTS5 text rank + 20% importance + optional temporal boost. "
+        "Supports temporal weighting to boost recent memories. Returns ranked results."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Natural language query."},
             "limit": {"type": "integer", "description": "Max results. Default 5.", "default": 5},
+            "temporal_weight": {
+                "type": "number",
+                "description": "How much to boost recent memories (0.0 = ignore time, 0.2 = mild recency bias, 0.5 = strong recency bias). Default 0.0.",
+                "default": 0.0,
+            },
+            "query_time": {
+                "type": "string",
+                "description": "ISO timestamp to treat as 'now' for temporal scoring. Default is current time.",
+                "default": "",
+            },
+            "temporal_halflife": {
+                "type": "number",
+                "description": "Hours until temporal boost decays by half. Default 24. Lower = faster decay.",
+                "default": 24,
+            },
         },
         "required": ["query"],
     },
@@ -232,11 +250,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall relevant context via Mnemosyne hybrid search."""
+        """Recall relevant context via Mnemosyne hybrid search with temporal weighting."""
         if not self._beam or self._agent_context in ("cron", "flush", "subagent"):
             return ""
         try:
-            results = self._beam.recall(query, top_k=8)
+            results = self._beam.recall(query, top_k=8, temporal_weight=0.2, temporal_halflife=48)
             if not results:
                 return ""
             lines = ["## Mnemosyne Context"]
@@ -265,12 +283,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     content=f"[USER] {user_content[:500]}",
                     source="conversation",
                     importance=0.3,
+                    extract_entities=True,
                 )
             if assistant_content and len(assistant_content) > 10:
                 self._beam.remember(
                     content=f"[ASSISTANT] {assistant_content[:800]}",
                     source="conversation",
                     importance=0.2,
+                    extract_entities=True,
                 )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
@@ -322,6 +342,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         source = args.get("source", "user")
         scope = args.get("scope", "session")
         valid_until = args.get("valid_until", None) or None
+        extract_entities = bool(args.get("extract_entities", False))
         if not content:
             return json.dumps({"error": "content is required"})
         memory_id = self._beam.remember(
@@ -330,16 +351,25 @@ class MnemosyneMemoryProvider(MemoryProvider):
             source=source,
             scope=scope,
             valid_until=valid_until,
+            extract_entities=extract_entities,
         )
-        return json.dumps({"status": "stored", "memory_id": memory_id, "content_preview": content[:100]})
+        return json.dumps({"status": "stored", "memory_id": memory_id, "content_preview": content[:100], "extract_entities": extract_entities})
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
         top_k = int(args.get("limit", 5))
+        temporal_weight = float(args.get("temporal_weight", 0.0))
+        query_time = args.get("query_time") or None
+        temporal_halflife_hours = float(args.get("temporal_halflife", 24))
         if not query:
             return json.dumps({"error": "query is required"})
-        results = self._beam.recall(query, top_k=top_k)
-        return json.dumps({"query": query, "count": len(results), "results": results})
+        results = self._beam.recall(
+            query, top_k=top_k,
+            temporal_weight=temporal_weight,
+            query_time=query_time,
+            temporal_halflife=temporal_halflife_hours,
+        )
+        return json.dumps({"query": query, "count": len(results), "temporal_weight": temporal_weight, "results": results})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
         self._beam.sleep()

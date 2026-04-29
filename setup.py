@@ -62,12 +62,14 @@ setup(
     extras_require={
         "llm": ["ctransformers>=0.2.27", "huggingface-hub>=0.20"],
         "embeddings": ["fastembed>=0.3.0"],
-        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0"],
+        "mcp": ["mcp>=1.0.0", "anyio>=4.0"],
+        "all": ["ctransformers>=0.2.27", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0", "anyio>=4.0"],
     },
     entry_points={
         "console_scripts": [
             "mnemosyne-install=mnemosyne.install:install",
             "mnemosyne-uninstall=mnemosyne.install:uninstall",
+            "mnemosyne=mnemosyne.cli:run_cli",
         ],
     },
 )
