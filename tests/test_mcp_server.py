@@ -216,8 +216,13 @@ class TestImportGuard:
 
     def test_mcp_server_raises_without_mcp(self):
         """MCP server raises helpful error if mcp not installed."""
-        # This is tested by checking the _MCP_AVAILABLE flag
-        from mnemosyne.mcp_server import _MCP_AVAILABLE
-        # In this test environment, mcp IS installed, so this passes
-        # But the code path for _MCP_AVAILABLE=False is covered by inspection
-        assert _MCP_AVAILABLE is True  # Because we have mcp installed
+        from mnemosyne.mcp_server import _MCP_AVAILABLE, _run_stdio
+        
+        if _MCP_AVAILABLE:
+            # mcp is installed — verify the server function exists and the flag is True
+            assert _MCP_AVAILABLE is True
+        else:
+            # mcp is NOT installed — verify _run_stdio raises RuntimeError
+            import asyncio
+            with pytest.raises(RuntimeError, match="MCP not installed"):
+                asyncio.get_event_loop().run_until_complete(_run_stdio())

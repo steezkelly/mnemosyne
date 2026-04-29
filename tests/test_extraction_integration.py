@@ -168,20 +168,16 @@ def test_graceful_fallback_no_llm():
     """
     Test: When LLM unavailable, memory still stores, no error
     """
+    from unittest.mock import patch
+    
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
         
-        # Ensure no LLM
-        old_url = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "")
-        old_enabled = os.environ.get("MNEMOSYNE_LLM_ENABLED", "")
+        mem = Mnemosyne(session_id="test_session_5", db_path=db_path)
         
-        try:
-            os.environ["MNEMOSYNE_LLM_BASE_URL"] = ""
-            os.environ["MNEMOSYNE_LLM_ENABLED"] = "false"
-            
-            mem = Mnemosyne(session_id="test_session_5", db_path=db_path)
-            
+        # Patch llm_available so extraction is skipped regardless of env state
+        with patch("mnemosyne.core.extraction.llm_available", return_value=False):
             # This should NOT raise even though extract=True and no LLM
             memory_id = mem.remember(
                 "I love coffee",
@@ -190,16 +186,13 @@ def test_graceful_fallback_no_llm():
             )
             
             assert memory_id is not None, "Memory ID should be returned"
-            
-            # No facts should be stored
-            triples = TripleStore(db_path=db_path)
-            all_facts = triples.query_by_predicate("fact")
-            assert len(all_facts) == 0, "No facts when LLM unavailable"
-            
-            print("PASS: test_graceful_fallback_no_llm")
-        finally:
-            os.environ["MNEMOSYNE_LLM_BASE_URL"] = old_url
-            os.environ["MNEMOSYNE_LLM_ENABLED"] = old_enabled
+        
+        # No facts should be stored
+        triples = TripleStore(db_path=db_path)
+        all_facts = triples.query_by_predicate("fact")
+        assert len(all_facts) == 0, "No facts when LLM unavailable"
+        
+        print("PASS: test_graceful_fallback_no_llm")
 
 
 def test_fact_aware_recall_boosts_scores():

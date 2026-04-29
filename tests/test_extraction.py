@@ -80,31 +80,33 @@ def test_parse_facts_empty():
 
 def test_extract_facts_safe_no_llm():
     """Test that extract_facts_safe returns empty list when no LLM."""
-    # Ensure no LLM is configured
-    old_base_url = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "")
-    old_enabled = os.environ.get("MNEMOSYNE_LLM_ENABLED", "")
+    from unittest.mock import patch
     
-    try:
-        os.environ["MNEMOSYNE_LLM_BASE_URL"] = ""
-        os.environ["MNEMOSYNE_LLM_ENABLED"] = "false"
-        
-        facts = extract_facts_safe("I love coffee")
+    # Patch llm_available at the extraction module level to ensure it returns False,
+    # regardless of what module-level constants were set at import time.
+    with patch("mnemosyne.core.extraction.llm_available", return_value=False):
+        facts = extract_facts_safe("I love coffee and this is long enough for extraction")
         assert facts == []
-        print("PASS: test_extract_facts_safe_no_llm")
-    finally:
-        os.environ["MNEMOSYNE_LLM_BASE_URL"] = old_base_url
-        os.environ["MNEMOSYNE_LLM_ENABLED"] = old_enabled
+    
+    print("PASS: test_extract_facts_safe_no_llm")
 
 
 def test_extract_facts_safe_exception_handling():
     """Test that extract_facts_safe never raises."""
+    from unittest.mock import patch
+    
     # Should not raise even with garbage input
     facts = extract_facts_safe(None)
     assert facts == []
     facts = extract_facts_safe("")
     assert facts == []
-    facts = extract_facts_safe("x")  # Too short for extraction
-    assert facts == []
+    
+    # "x" is valid text but too short for meaningful extraction.
+    # Patch llm_available to ensure no LLM call is attempted.
+    with patch("mnemosyne.core.extraction.llm_available", return_value=False):
+        facts = extract_facts_safe("x")
+        assert facts == []
+    
     print("PASS: test_extract_facts_safe_exception_handling")
 
 
