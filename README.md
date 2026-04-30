@@ -596,6 +596,30 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
+<div align="center">
+
+### ❤️ Support Mnemosyne
+
+If this project saves you time or helps your agents remember, consider supporting it:
+
+<br/>
+
+<a href="https://github.com/sponsors/AxDSan">
+  <img src="https://img.shields.io/badge/💖_GitHub_Sponsors-30363D?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Sponsors"/>
+</a>
+<a href="https://ko-fi.com/axdsan">
+  <img src="https://img.shields.io/badge/☕_Ko‑fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"/>
+</a>
+
+<br/>
+<br/>
+
+⭐ Star the repo if you find it useful!
+
+</div>
+
+---
+
 ## License
 
 MIT License — See [LICENSE](LICENSE)
