@@ -806,8 +806,9 @@ class BeamMemory:
         self.conn.commit()
 
     def get_context(self, limit: int = 10) -> List[Dict]:
-        """Get recent working_memory for prompt injection.
-        Global memories are returned first, then session memories."""
+        """Get working_memory for prompt injection.
+        Global memories first, then sorted by importance (high first),
+        then by recency. High-importance rules/bans surface reliably."""
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
         cursor.execute("""
@@ -818,6 +819,7 @@ class BeamMemory:
               AND superseded_by IS NULL
             ORDER BY
                 CASE WHEN scope = 'global' THEN 0 ELSE 1 END,
+                importance DESC,
                 timestamp DESC
             LIMIT ?
         """, (self.session_id, now, limit))

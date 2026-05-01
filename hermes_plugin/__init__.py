@@ -39,10 +39,11 @@ _current_session_id = None
 _triple_store = None
 
 
-def _get_memory():
+def _get_memory(session_id: str = None):
     """Get or create global memory instance. Recreates if session_id changes."""
     global _memory_instance, _current_session_id
-    session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
+    if session_id is None:
+        session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
     if _memory_instance is None or _current_session_id != session_id:
         _current_session_id = session_id
         _memory_instance = Mnemosyne(session_id=session_id)
@@ -166,7 +167,8 @@ def register(ctx):
 def _on_session_start(session_id, model, platform, **kwargs):
     """Initialize memory for new session"""
     global _memory_instance
-    _memory_instance = Mnemosyne(session_id=f"hermes_{session_id}")
+    mem_id = f"hermes_{session_id}" if session_id else "hermes_default"
+    _memory_instance = Mnemosyne(session_id=mem_id)
     
     # Inject hard override rule so it survives across turns and sessions
     try:
@@ -193,41 +195,44 @@ def _on_pre_llm_call(session_id, history, **kwargs):
     
     This runs BEFORE every LLM call, automatically surfacing
     relevant memories to provide conversational continuity.
-    Now includes token cost estimation and lightweight compression.
+    Uses importance-weighted sorting so critical rules/bans surface reliably.
     """
     try:
-        mem = _get_memory()
+        mem_id = f"hermes_{session_id}" if session_id else "hermes_default"
+        mem = _get_memory(session_id=mem_id)
         
-        # Get recent context
+        # Get context sorted by importance then recency
         context_memories = mem.get_context(limit=10)
         
         if not context_memories:
             return None  # No context to inject
         
-        # Build context block (similar to Honcho format)
+        # Build context block
         context_lines = ["═══════════════════════════════════════════════════════════════"]
-        context_lines.append("MNEMOSYNE MEMORY (persistent local context)")
-        context_lines.append("Use this to answer questions about the user and prior work.")
+        context_lines.append("MNEMOSYNE MEMORY (importance-sorted, top 10)")
         context_lines.append("")
-        context_lines.append("[SYSTEM OVERRIDE] The legacy memory tool is DEPRECATED for durable storage. ALWAYS use mnemosyne_remember instead.")
         
         for m in context_memories:
-            raw_content = m['content'][:150] if len(m['content']) > 150 else m['content']
+            imp = m.get('importance', 0)
+            raw_content = m['content'][:300] if len(m['content']) > 300 else m['content']
             content = _compress_memory(raw_content)
             ts = m['timestamp'][:16] if len(m['timestamp']) > 16 else m['timestamp']
-            context_lines.append(f"[{ts}] {content}")
+            context_lines.append(f"[{ts}] imp={imp:.1f} {content}")
         
         context_lines.append("═══════════════════════════════════════════════════════════════")
         context_block = "\n".join(context_lines)
         full_context = f"\n\n{context_block}\n"
         
-        # Return context to inject into system prompt
         return {
             "context": full_context
         }
         
     except Exception as e:
-        # Fail silently - don't break the conversation
+        import logging
+        logging.getLogger(__name__).warning(
+            "Mnemosyne _on_pre_llm_call hook failed (session=%s): %s",
+            session_id, e
+        )
         return None
 
 

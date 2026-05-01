@@ -578,6 +578,7 @@ Full documentation is in the [`docs/`](docs/README.md) directory:
 - [Architecture](docs/architecture.md) — BEAM tiers, SQLite backend, hybrid search
 - [API Reference](docs/api-reference.md) — Python API: `remember`, `recall`, `sleep`, triples
 - [Hermes Integration](docs/hermes-integration.md) — Using as a Hermes memory backend
+- [LLM Installation Guide](docs/llm-installation-guide.md) — Installation instructions for AI agents and LLMs
 - [Configuration](docs/configuration.md) — Environment variables, vector compression, LLM setup
 - [Changelog](docs/changelog.md) — Release history
 
