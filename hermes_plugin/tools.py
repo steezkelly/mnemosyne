@@ -277,13 +277,42 @@ FORGET_SCHEMA = {
 
 IMPORT_SCHEMA = {
     "name": "mnemosyne_import",
-    "description": "Import Mnemosyne memories from a JSON file. Idempotent by default.",
+    "description": "Import Mnemosyne memories from a JSON file or another memory provider (Mem0, etc.). Idempotent by default.",
     "parameters": {
         "type": "object",
         "properties": {
             "input_path": {
                 "type": "string",
-                "description": "File path to read the export JSON from"
+                "description": "File path to read the export JSON from (for file imports)"
+            },
+            "provider": {
+                "type": "string",
+                "description": "Provider to import from: 'mem0'. Requires api_key. Use --list-providers to see supported providers."
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for the source provider (can also be set via env var: MEM0_API_KEY)"
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Filter imported memories by user ID (provider-specific)"
+            },
+            "agent_id": {
+                "type": "string",
+                "description": "Filter imported memories by agent ID (provider-specific)"
+            },
+            "base_url": {
+                "type": "string",
+                "description": "Base URL for self-hosted provider instances"
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, validate and transform but don't write any memories",
+                "default": False
+            },
+            "channel_id": {
+                "type": "string",
+                "description": "Channel to assign imported memories to"
             },
             "force": {
                 "type": "boolean",
@@ -291,7 +320,7 @@ IMPORT_SCHEMA = {
                 "default": False
             }
         },
-        "required": ["input_path"]
+        "required": []
     }
 }
 
@@ -538,14 +567,50 @@ def mnemosyne_forget(args: dict, **kwargs) -> str:
 
 
 def mnemosyne_import(args: dict, **kwargs) -> str:
-    """Import memories from a JSON file"""
+    """Import memories from a JSON file or another memory provider."""
     try:
+        provider = args.get("provider", "").strip().lower()
         input_path = args.get("input_path", "").strip()
+        dry_run = args.get("dry_run", False)
+        channel_id = args.get("channel_id")
         force = args.get("force", False)
-        if not input_path:
-            return json.dumps({"error": "input_path is required"})
 
         mem = _get_memory()
+
+        # Cross-provider import
+        if provider:
+            api_key = args.get("api_key", "").strip()
+            user_id = args.get("user_id", "").strip() or None
+            agent_id = args.get("agent_id", "").strip() or None
+            base_url = args.get("base_url", "").strip() or None
+
+            if not api_key:
+                import os
+                env_key = f"{provider.upper()}_API_KEY"
+                api_key = os.environ.get(env_key, "")
+            if not api_key:
+                return json.dumps({
+                    "error": f"api_key required for {provider} import. Set {provider.upper()}_API_KEY env var or pass api_key parameter."
+                })
+
+            from mnemosyne.core.importers import import_from_provider
+            result = import_from_provider(
+                provider, mem,
+                api_key=api_key,
+                user_id=user_id,
+                agent_id=agent_id,
+                base_url=base_url,
+                dry_run=dry_run,
+                channel_id=channel_id,
+            )
+            return json.dumps(result.to_dict())
+
+        # File import
+        if not input_path:
+            return json.dumps({
+                "error": "Either input_path (for file import) or provider (for cross-provider import) is required"
+            })
+
         stats = mem.import_from_file(input_path, force=force)
         return json.dumps({
             "status": "imported",

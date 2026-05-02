@@ -35,9 +35,21 @@ def register_cli(subparser):
     export_cmd = mn_cmds.add_parser("export", help="Export all memories to a JSON file")
     export_cmd.add_argument("--output", "-o", type=str, required=True, help="Output JSON file path")
 
-    import_cmd = mn_cmds.add_parser("import", help="Import memories from a JSON file")
-    import_cmd.add_argument("--input", "-i", type=str, required=True, help="Input JSON file path")
-    import_cmd.add_argument("--force", action="store_true", help="Overwrite existing records")
+    import_cmd = mn_cmds.add_parser("import", help="Import memories from a JSON file or another provider")
+    import_cmd.add_argument("--input", "-i", type=str, help="Input JSON file path (for file imports)")
+    import_cmd.add_argument("--force", action="store_true", help="Overwrite existing records (file import)")
+    import_cmd.add_argument("--from", dest="from_provider", type=str, help="Provider to import from (e.g., 'mem0')")
+    import_cmd.add_argument("--api-key", type=str, help="Provider API key (or set env var)")
+    import_cmd.add_argument("--user-id", type=str, help="Filter by user ID (provider-specific)")
+    import_cmd.add_argument("--agent-id", type=str, help="Filter by agent ID (provider-specific)")
+    import_cmd.add_argument("--base-url", type=str, help="Provider base URL (for self-hosted)")
+    import_cmd.add_argument("--dry-run", action="store_true", help="Validate but don't import")
+    import_cmd.add_argument("--session-id", type=str, help="Override session for imported memories")
+    import_cmd.add_argument("--channel-id", type=str, help="Channel for imported memories")
+    import_cmd.add_argument("--list-providers", action="store_true", help="List supported import providers")
+    import_cmd.add_argument("--generate-script", action="store_true", help="Generate a migration script for the provider")
+    import_cmd.add_argument("--agentic", action="store_true", help="Generate agent migration instructions (prompt to give your AI agent)")
+    import_cmd.add_argument("--output-script", type=str, help="Save generated script to file")
 
     subparser.set_defaults(func=mnemosyne_command)
 
@@ -111,14 +123,125 @@ def mnemosyne_command(args):
             return 1
 
     elif cmd == "import":
+        # --list-providers
+        if getattr(args, "list_providers", False):
+            from mnemosyne.core.importers import PROVIDERS
+            print("Supported import providers:")
+            for name, info in PROVIDERS.items():
+                print(f"  {name}: {info['description']}")
+                print(f"         docs: {info['docs']}")
+                print(f"         env key: {info['env_key']}")
+                print(f"         pip: {info['pypi_package']}")
+            return 0
+
+        # --agentic: generate instructions for user's AI agent
+        generate_script_flag = getattr(args, "generate_script", False)
+        agentic_flag = getattr(args, "agentic", False)
+        from_provider = getattr(args, "from_provider", None)
+        output_script = getattr(args, "output_script", None)
+
+        if agentic_flag and from_provider:
+            from mnemosyne.core.importers.agentic import generate_agent_instructions
+            instructions = generate_agent_instructions(from_provider)
+            if output_script:
+                Path(output_script).write_text(instructions)
+                print(f"Agent instructions saved to {output_script}")
+            else:
+                print(instructions)
+            return 0
+
+        if generate_script_flag and from_provider:
+            from mnemosyne.core.importers.agentic import generate_migration_script
+            api_key = getattr(args, "api_key", None)
+            user_id = getattr(args, "user_id", None)
+            script = generate_migration_script(
+                from_provider,
+                api_key=api_key or "",
+                user_id=user_id or "",
+            )
+            if output_script:
+                Path(output_script).write_text(script)
+                print(f"Migration script saved to {output_script}")
+            else:
+                print(script)
+            return 0
+
+        cross_provider = from_provider
         input_path = getattr(args, "input", None)
+        dry_run = getattr(args, "dry_run", False)
+        session_id = getattr(args, "session_id", None)
+        channel_id = getattr(args, "channel_id", None)
+
+        try:
+            from mnemosyne.core.memory import Mnemosyne
+            mem = Mnemosyne(session_id=session_id or "import_session",
+                            channel_id=channel_id)
+        except Exception as e:
+            print(f"Error: Mnemosyne not available: {e}")
+            return 1
+
+        # Cross-provider import
+        if cross_provider:
+            api_key = getattr(args, "api_key", None)
+            user_id = getattr(args, "user_id", None)
+            agent_id = getattr(args, "agent_id", None)
+            base_url = getattr(args, "base_url", None)
+
+            # Try env var fallback
+            import os
+            if not api_key:
+                info = __import__("mnemosyne.core.importers", fromlist=["PROVIDERS"]).PROVIDERS
+                pk = info.get(cross_provider, {}).get("env_key", "")
+                if pk:
+                    api_key = os.environ.get(pk)
+            if not api_key:
+                print(f"Error: --api-key required for {cross_provider} import. "
+                      f"Or set the {cross_provider.upper()}_API_KEY env var.")
+                return 1
+
+            print(f"Importing from {cross_provider}...")
+            if dry_run:
+                print("  (dry-run mode: no memories will be written)")
+
+            try:
+                from mnemosyne.core.importers import import_from_provider
+                result = import_from_provider(
+                    cross_provider, mem,
+                    api_key=api_key,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    base_url=base_url,
+                    dry_run=dry_run,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                )
+                print(f"\nImport complete:")
+                print(f"  Total found: {result.total}")
+                print(f"  Imported:    {result.imported}")
+                print(f"  Skipped:     {result.skipped}")
+                print(f"  Failed:      {result.failed}")
+                if result.errors:
+                    print(f"  Errors:")
+                    for err in result.errors[:10]:
+                        print(f"    - {err}")
+                    if len(result.errors) > 10:
+                        print(f"    ... and {len(result.errors) - 10} more")
+                return 0 if result.failed == 0 else 1
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+            except Exception as e:
+                print(f"Import failed: {e}")
+                return 1
+
+        # File import
         force = getattr(args, "force", False)
         if not input_path:
             print("Usage: hermes mnemosyne import --input <path> [--force]")
+            print("       hermes mnemosyne import --from <provider> --api-key <key> [--dry-run]")
+            print("       hermes mnemosyne import --list-providers")
             return 1
         try:
-            from mnemosyne.core.memory import Mnemosyne
-            mem = Mnemosyne(session_id="hermes_default")
             stats = mem.import_from_file(input_path, force=force)
             beam_stats = stats.get("beam", {})
             legacy_stats = stats.get("legacy", {})
