@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -210,7 +211,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._agent_context = "primary"
         self._turn_count = 0
         self._auto_sleep_threshold = 50
-        self._auto_sleep_enabled = True
+        self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
     @property
     def name(self) -> str:
@@ -226,7 +227,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold", "default": True},
+            {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold (default: false — set MNEMOSYNE_AUTO_SLEEP_ENABLED=true to enable)", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
             {"key": "vector_type", "description": "Vector storage type", "choices": ["float32", "int8", "bit"], "default": "float32"},
         ]
@@ -319,10 +320,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
                 logger.info("Mnemosyne auto-sleep: working=%d > threshold=%d", working, self._auto_sleep_threshold)
-                if hasattr(self._beam, "sleep_all_sessions"):
-                    self._beam.sleep_all_sessions()
-                else:
-                    self._beam.sleep()
+                sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
+                sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
+                sleep_thread.start()
+                sleep_thread.join(timeout=5)
+                if sleep_thread.is_alive():
+                    logger.warning("Mnemosyne auto-sleep timed out after 5s — consolidation deferred")
         except Exception:
             pass
 
