@@ -753,6 +753,13 @@ For each rubric item, score how well the AI's answer matches. Return JSON with s
     response = llm.chat(messages, temperature=0.0, max_tokens=500)
 
     # Parse JSON from response
+    if response is None:
+        return {
+            "scores": [0.0] * len(rubric),
+            "overall_score": 0.0,
+            "assessment": "LLM judge returned None (timeout or error)",
+        }
+    
     try:
         json_start = response.find("{")
         json_end = response.rfind("}") + 1
