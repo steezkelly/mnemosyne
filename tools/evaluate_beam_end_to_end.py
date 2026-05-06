@@ -428,6 +428,40 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
         beam.remember_batch(batch_items)
         stats["wm_count"] += len(batch_items)
 
+        # Cloud fact extraction: extract facts from batch if enabled
+        if getattr(beam, 'use_cloud', False):
+            try:
+                from mnemosyne.extraction import ExtractionClient
+                if beam._extraction_client is None:
+                    beam._extraction_client = ExtractionClient()
+                facts = beam._extraction_client.extract_facts(batch_msgs)
+                if facts:
+                    cursor = beam.conn.cursor()
+                    import hashlib
+                    for fact in facts:
+                        fact_id = hashlib.sha256(
+                            f"{fact.get('subject','')}:{fact.get('predicate','')}:{fact.get('object','')}:{batch_start}".encode()
+                        ).hexdigest()[:24]
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO facts
+                            (fact_id, session_id, subject, predicate, object,
+                             timestamp, source_msg_id, confidence)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            fact_id,
+                            beam.session_id,
+                            fact.get("subject", ""),
+                            fact.get("predicate", "stated"),
+                            fact.get("object", ""),
+                            fact.get("timestamp", ""),
+                            fact.get("source_msg_id", ""),
+                            fact.get("confidence", 0.7),
+                        ))
+                    beam.conn.commit()
+                    stats["fact_count"] = stats.get("fact_count", 0) + len(facts)
+            except Exception:
+                pass  # Best-effort; don't fail ingestion
+
         # Episodic consolidation per batch
         try:
             cursor = beam.conn.cursor()
