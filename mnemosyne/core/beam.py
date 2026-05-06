@@ -534,8 +534,12 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
 
 def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
     """
-    Extract structured facts from content using LLM and store as triples.
+    Extract structured facts from content using LLM and store as triples + facts table.
     Called internally by remember() when extract=True.
+
+    Stores in TWO places:
+    1. TripleStore (entity-level triples, backward compat)
+    2. facts table (structured SPO facts for fact_recall())
     """
     try:
         from mnemosyne.core.extraction import extract_facts_safe
@@ -545,11 +549,52 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
         if not facts:
             return
         
+        # Store in triples (existing behavior)
         triples = TripleStore(db_path=beam.db_path)
         triples.add_facts(memory_id, facts, source=source, confidence=0.7)
+
+        # ALSO store in facts table (new cloud extraction path)
+        _store_facts_in_table(beam, memory_id, content, source, facts)
+
     except Exception:
         # Fact extraction is best-effort; never fail remember() because of it
         pass
+
+
+def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
+                          content: str, source: str, facts: list):
+    """Store extracted free-text facts as simple SPO entries in the facts table."""
+    import hashlib
+    cursor = beam.conn.cursor()
+    timestamp = __import__('datetime').datetime.now().isoformat()
+    
+    for i, fact_text in enumerate(facts):
+        # Derive subject from source, predicate = "stated", object = fact text
+        subject = source or "user"
+        fact_id = hashlib.sha256(
+            f"{memory_id}:fact:{i}:{fact_text[:50]}".encode()
+        ).hexdigest()[:24]
+
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO facts
+                (fact_id, session_id, subject, predicate, object,
+                 timestamp, source_msg_id, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                fact_id,
+                beam.session_id,
+                subject,
+                "stated",
+                fact_text,
+                timestamp,
+                memory_id,
+                0.7,
+            ))
+        except Exception:
+            continue  # Best-effort per fact
+    
+    beam.conn.commit()
 
 
 def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: float = 0.8) -> List[str]:
@@ -750,12 +795,15 @@ class BeamMemory:
 
     def __init__(self, session_id: str = "default", db_path: Path = None,
                  author_id: str = None, author_type: str = None,
-                 channel_id: str = None):
+                 channel_id: str = None, use_cloud: bool = False):
         self.session_id = session_id
         self.author_id = author_id
         self.author_type = author_type
         self.channel_id = channel_id or session_id  # default channel = session
         self.db_path = db_path or DEFAULT_DB_PATH
+        self.use_cloud = use_cloud  # Enable LLM fact extraction during remember()
+        self._extraction_client = None  # Lazy-loaded ExtractionClient
+        self._extraction_buffer = []  # Buffer for batch extraction
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
@@ -1736,6 +1784,74 @@ class BeamMemory:
         self.conn.commit()
 
         return final_results
+
+    def fact_recall(self, query: str, top_k: int = 30) -> List[Dict]:
+        """Search the facts table (LLM-extracted structured knowledge).
+
+        Returns facts as list of dicts with: content, score, fact_id, subject, predicate.
+
+        Falls back gracefully if facts table is empty or sqlite-vec unavailable.
+        """
+        cursor = self.conn.cursor()
+        results = []
+        query_lower = query.lower()
+
+        # Try FTS5 search first
+        try:
+            fts_rows = cursor.execute(
+                "SELECT rowid, rank FROM fts_facts WHERE fts_facts MATCH ? ORDER BY rank LIMIT ?",
+                (query, top_k * 3)
+            ).fetchall()
+        except Exception:
+            fts_rows = []
+
+        if not fts_rows:
+            # Fallback: simple LIKE scan
+            for word in query_lower.split()[:6]:
+                if len(word) < 3:
+                    continue
+                try:
+                    like_rows = cursor.execute(
+                        "SELECT rowid FROM facts WHERE subject LIKE ? OR predicate LIKE ? OR object LIKE ? LIMIT ?",
+                        (f"%{word}%", f"%{word}%", f"%{word}%", top_k)
+                    ).fetchall()
+                except Exception:
+                    continue
+                for row in like_rows:
+                    if row["rowid"] not in {r["rowid"] for r in fts_rows}:
+                        fts_rows.append({"rowid": row["rowid"], "rank": 0})
+
+        if not fts_rows:
+            return []
+
+        # Get full rows for matched fact IDs
+        fact_ids = [r["rowid"] for r in fts_rows[:top_k]]
+        placeholders = ",".join("?" * len(fact_ids))
+
+        try:
+            cursor.execute(f"""
+                SELECT fact_id, subject, predicate, object,
+                       timestamp, confidence
+                FROM facts
+                WHERE rowid IN ({placeholders})
+                ORDER BY confidence DESC
+                LIMIT ?
+            """, (*fact_ids, top_k))
+            fact_rows = cursor.fetchall()
+        except Exception:
+            return []
+
+        for row in fact_rows:
+            fact_text = row["object"] if row["object"] else f"{row['subject']} {row['predicate']} {row['object']}"
+            results.append({
+                "content": fact_text,
+                "score": row.get("confidence", 0.5),
+                "fact_id": row["fact_id"],
+                "subject": row.get("subject", ""),
+                "predicate": row.get("predicate", ""),
+            })
+
+        return results
 
     def get_episodic_stats(self, author_id: str = None, author_type: str = None,
                            channel_id: str = None) -> Dict:
