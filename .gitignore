@@ -1,5 +1,10 @@
 # Python
 __pycache__/
+
+# Mnemosyne Cloud — commercial plans (NEVER commit)
+.planning/
+
+# Python compiled
 *.py[cod]
 *$py.class
 *.so
