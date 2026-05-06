@@ -57,7 +57,7 @@ from mnemosyne.core.beam import BeamMemory, init_beam, _embeddings, _vec_availab
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-DEFAULT_MODEL = "google/gemini-flash-latest"
+DEFAULT_MODEL = "google/gemini-2.5-flash"
 FALLBACK_MODELS = [
     "google/gemini-2.5-pro",  
 ]
@@ -827,6 +827,10 @@ def evaluate_conversation(
         ai_answer = answer_with_memory(llm, beam, question, 
                                        conversation_messages=conversation.get("messages", []))
         answer_time = time.perf_counter() - t0
+
+        # Handle None answer (LLM timeout/error)
+        if ai_answer is None:
+            ai_answer = "[LLM_ERROR: No response from answering model]"
 
         # Step 2: LLM-as-judge scores the answer
         t0 = time.perf_counter()
