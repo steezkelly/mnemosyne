@@ -103,7 +103,7 @@ def cmd_update(args):
     if success:
         print(f"Updated: {memory_id}")
     else:
-        print(f"Memory not found: {memory_id}")
+        _fail(f"Memory not found: {memory_id}", exit_code=1)
 
 
 def cmd_delete(args):
@@ -118,7 +118,7 @@ def cmd_delete(args):
     if success:
         print(f"Deleted: {memory_id}")
     else:
-        print(f"Memory not found: {memory_id}")
+        _fail(f"Memory not found: {memory_id}", exit_code=1)
 
 
 def cmd_stats(args):
