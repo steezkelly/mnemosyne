@@ -2157,14 +2157,21 @@ class BeamMemory:
         except Exception:
             return []
 
-        for row in fact_rows:
+        for raw_row in fact_rows:
+            # sqlite3.Row supports bracket access but not .get(); convert to
+            # dict so the column-with-default reads below work. Without this
+            # conversion fact_recall crashes the moment the facts table
+            # contains rows — a latent bug that was masked while the
+            # Mnemosyne.remember(extract=True) wrapper never populated the
+            # table (see C12.a).
+            row = dict(raw_row)
             fact_text = row["object"] if row["object"] else f"{row['subject']} {row['predicate']} {row['object']}"
             results.append({
                 "content": fact_text,
-                "score": row.get("confidence", 0.5),
+                "score": row.get("confidence") if row.get("confidence") is not None else 0.5,
                 "fact_id": row["fact_id"],
-                "subject": row.get("subject", ""),
-                "predicate": row.get("predicate", ""),
+                "subject": row.get("subject") or "",
+                "predicate": row.get("predicate") or "",
             })
 
         return results
