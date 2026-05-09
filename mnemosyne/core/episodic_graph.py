@@ -349,22 +349,22 @@ class EpisodicGraph:
         ))
         self.conn.commit()
     
-    def store_fact(self, fact: Fact, memory_id: str):
+    def store_fact(self, fact: Fact, memory_id: str, session_id: str = "default"):
         """Store a fact in the database."""
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO facts
-            (id, subject, predicate, object, timestamp, confidence, temporal_qualifier, memory_id)
+            (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             fact.id,
+            session_id,
             fact.subject,
             fact.predicate,
             fact.object,
             fact.timestamp,
-            fact.confidence,
-            fact.temporal_qualifier,
-            memory_id
+            memory_id,
+            fact.confidence
         ))
         self.conn.commit()
     
@@ -430,13 +430,13 @@ class EpisodicGraph:
         facts = []
         for row in cursor.fetchall():
             facts.append(Fact(
-                id=row["id"],
+                id=row["fact_id"],
                 subject=row["subject"],
                 predicate=row["predicate"],
                 object=row["object"],
                 timestamp=row["timestamp"],
                 confidence=row["confidence"],
-                temporal_qualifier=row["temporal_qualifier"]
+                temporal_qualifier=None  # Not in beam.py facts schema
             ))
         
         return facts

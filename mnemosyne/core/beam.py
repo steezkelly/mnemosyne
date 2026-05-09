@@ -1837,7 +1837,7 @@ class BeamMemory:
                     # Check if facts from graph match query terms
                     cursor2 = self.conn.cursor()
                     cursor2.execute(
-                        "SELECT subject, predicate, object FROM facts WHERE memory_id = ?",
+                        "SELECT subject, predicate, object FROM facts WHERE source_msg_id = ?",
                         (memory_id,))
                     query_lower_words = [w for w in query.lower().split() if len(w) > 2]
                     match_count = 0
@@ -1922,7 +1922,7 @@ class BeamMemory:
                     try:
                         cursor2 = self.conn.cursor()
                         cursor2.execute(
-                            "SELECT subject, predicate, object FROM facts WHERE memory_id = ?",
+                            "SELECT subject, predicate, object FROM facts WHERE source_msg_id = ?",
                             (row["id"],))
                         qlw = [w for w in query.lower().split() if len(w) > 2]
                         mc = 0
