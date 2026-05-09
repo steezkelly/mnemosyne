@@ -269,20 +269,22 @@ class TestMnemosynePatternMethods:
         assert summary["total_memories"] >= 2
 
     def test_get_all_memories_returns_working_and_episodic(self, tmp_path):
-        """get_all_memories must combine working_memory and episodic_memory rows."""
+        """get_all_memories must combine working_memory and episodic_memory rows.
+
+        Drives the episodic insert through the public consolidate_to_episodic
+        API instead of raw SQL, so the test does not break the next time the
+        episodic_memory schema gains a NOT NULL column.
+        """
         from mnemosyne.core.memory import Mnemosyne
         mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
-        mem.remember("Working item one", source="user", importance=0.5)
+        wm_id_one = mem.remember("Working item one", source="user", importance=0.5)
         mem.remember("Working item two", source="agent", importance=0.5)
-        # Manually insert an episodic row to avoid driving the full sleep path here
-        cursor = mem.beam.conn.cursor()
-        cursor.execute(
-            """INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            ("ep-c26-1", "Episodic summary one", "consolidation",
-             "2026-05-09T09:00:00", "c26", 0.6),
+        mem.beam.consolidate_to_episodic(
+            summary="Episodic summary one",
+            source_wm_ids=[wm_id_one],
+            source="consolidation",
+            importance=0.6,
         )
-        mem.beam.conn.commit()
 
         rows = mem.get_all_memories()
         assert isinstance(rows, list)
@@ -295,3 +297,15 @@ class TestMnemosynePatternMethods:
             assert "content" in r
             assert "timestamp" in r
             assert "source" in r
+
+    def test_get_all_memories_excludes_invalidated(self, tmp_path):
+        """Invalidated memories must not surface in pattern analysis."""
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+        mem.remember("Keep me visible", source="user", importance=0.5)
+        drop_id = mem.remember("Forget about this rule", source="user", importance=0.5)
+        mem.invalidate(drop_id)
+
+        contents = [r["content"] for r in mem.get_all_memories()]
+        assert "Keep me visible" in contents
+        assert "Forget about this rule" not in contents
