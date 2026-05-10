@@ -893,6 +893,17 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank LIMIT ?",
         (fts_query, k)
     ).fetchall()
+
+    # BEAM mode: if phrase query returns 0, fall back to individual word OR search
+    # This handles cases like "What operating system" where no single entry has
+    # all content words but individual words like "operating" or "system" may match
+    if not rows and _BEAM_MODE and len(content_words) > 1:
+        fts_query_fallback = " OR ".join(content_words)
+        rows = conn.execute(
+            "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank LIMIT ?",
+            (fts_query_fallback, k)
+        ).fetchall()
+
     return [{"id": r["id"], "rank": r["rank"]} for r in rows]
 
 
