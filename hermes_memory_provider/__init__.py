@@ -55,7 +55,11 @@ REMEMBER_SCHEMA = {
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
-        "extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match)."
+        "extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match). "
+        "Use extract=True to also pull subject-predicate-object fact triples via LLM "
+        "for fact-aware recall. Use veracity to tag confidence: 'stated' for direct "
+        "user assertions, 'tool' for deterministic tool output, 'inferred' for derived "
+        "guesses; 'unknown' (default) gets no recall boost."
     ),
     "parameters": {
         "type": "object",
@@ -66,6 +70,9 @@ REMEMBER_SCHEMA = {
             "scope": {"type": "string", "description": "'session' (default) or 'global'.", "default": "session"},
             "valid_until": {"type": "string", "description": "Optional expiry date YYYY-MM-DD.", "default": ""},
             "extract_entities": {"type": "boolean", "description": "Extract named entities for fuzzy recall. Default False.", "default": False},
+            "extract": {"type": "boolean", "description": "Extract subject-predicate-object fact triples via LLM for fact-aware recall. Default False.", "default": False},
+            "metadata": {"type": "object", "description": "Optional dict of additional fields (source_doc, tags, page, etc.). Default empty.", "default": {}},
+            "veracity": {"type": "string", "description": "Confidence label: 'stated' | 'inferred' | 'tool' | 'imported' | 'unknown'. Default 'unknown'.", "default": "unknown"},
         },
         "required": ["content"],
     },
@@ -400,6 +407,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         scope = args.get("scope", "session")
         valid_until = args.get("valid_until", None) or None
         extract_entities = bool(args.get("extract_entities", False))
+        extract = bool(args.get("extract", False))
+        metadata = args.get("metadata") or None
+        veracity = args.get("veracity", "unknown") or "unknown"
         if not content:
             return json.dumps({"error": "content is required"})
         memory_id = self._beam.remember(
@@ -409,8 +419,18 @@ class MnemosyneMemoryProvider(MemoryProvider):
             scope=scope,
             valid_until=valid_until,
             extract_entities=extract_entities,
+            extract=extract,
+            metadata=metadata,
+            veracity=veracity,
         )
-        return json.dumps({"status": "stored", "memory_id": memory_id, "content_preview": content[:100], "extract_entities": extract_entities})
+        return json.dumps({
+            "status": "stored",
+            "memory_id": memory_id,
+            "content_preview": content[:100],
+            "extract_entities": extract_entities,
+            "extract": extract,
+            "veracity": veracity,
+        })
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")

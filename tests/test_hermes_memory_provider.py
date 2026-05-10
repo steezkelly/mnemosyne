@@ -244,3 +244,96 @@ def test_shutdown_proceeds_when_drain_times_out(caplog):
 def test_shutdown_drain_default_matches_design():
     """Production drain default should remain 2s."""
     assert MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 2
+
+
+# ---------------------------------------------------------------------------
+# C12.b — REMEMBER_SCHEMA + _handle_remember per-call kwargs parity
+# ---------------------------------------------------------------------------
+#
+# BeamMemory.remember() accepts extract, metadata, veracity per call. The
+# plugin's REMEMBER_SCHEMA used to only expose content/importance/source/
+# scope/valid_until/extract_entities, so callers passing any of the missing
+# fields had them silently stripped:
+#   - extract=True (LLM fact-triple extraction): facts never extracted
+#   - metadata={...} (source/tag tracking): provenance lost
+#   - veracity="stated"/"tool"/...: every plugin memory defaulted to "unknown",
+#     defeating the veracity boost in recall
+# These tests lock the schema → handler → beam wiring.
+
+def test_remember_schema_advertises_extract_and_metadata_and_veracity():
+    """[C12.b] REMEMBER_SCHEMA must advertise the per-call kwargs that
+    beam.remember() actually supports, so Hermes' tool-arg validator
+    accepts them instead of stripping them as unknown fields."""
+    from hermes_memory_provider import REMEMBER_SCHEMA
+
+    props = REMEMBER_SCHEMA["parameters"]["properties"]
+    assert "extract" in props, (
+        "REMEMBER_SCHEMA missing 'extract' — LLM fact-triple extraction "
+        "is unreachable through the plugin"
+    )
+    assert "metadata" in props, (
+        "REMEMBER_SCHEMA missing 'metadata' — caller-supplied tags / "
+        "source-doc IDs get silently dropped"
+    )
+    assert "veracity" in props, (
+        "REMEMBER_SCHEMA missing 'veracity' — every plugin-stored memory "
+        "defaults to 'unknown', defeating recall's veracity weighting"
+    )
+    # Sanity-check the advertised types so a typo doesn't slip in.
+    assert props["extract"]["type"] == "boolean"
+    assert props["metadata"]["type"] == "object"
+    assert props["veracity"]["type"] == "string"
+
+
+def test_handle_remember_passes_extract_metadata_veracity_to_beam(monkeypatch):
+    """[C12.b] _handle_remember must forward extract / metadata / veracity
+    to beam.remember(). Pre-fix the args were either ignored (no .get())
+    or never wired into the beam call."""
+    from hermes_memory_provider import MnemosyneMemoryProvider
+
+    provider = MnemosyneMemoryProvider()
+    beam = MagicMock()
+    beam.remember.return_value = "mem-123"
+    provider._beam = beam
+
+    args = {
+        "content": "Sarah leads Project Falcon, started 2026-04-01.",
+        "extract": True,
+        "metadata": {"source_doc": "kickoff-deck.pdf", "page": 3},
+        "veracity": "stated",
+    }
+    provider._handle_remember(args)
+
+    beam.remember.assert_called_once()
+    kwargs = beam.remember.call_args.kwargs
+    assert kwargs.get("extract") is True, (
+        "extract=True was not forwarded to beam.remember — LLM fact "
+        "extraction is unreachable through the plugin tool"
+    )
+    assert kwargs.get("metadata") == {"source_doc": "kickoff-deck.pdf", "page": 3}, (
+        f"metadata not forwarded to beam.remember; got {kwargs.get('metadata')!r}"
+    )
+    assert kwargs.get("veracity") == "stated", (
+        f"veracity not forwarded to beam.remember; got {kwargs.get('veracity')!r}"
+    )
+
+
+def test_handle_remember_defaults_when_new_kwargs_omitted(monkeypatch):
+    """[C12.b] Pre-existing callers that don't pass the new kwargs must not
+    break: extract defaults False, metadata defaults None, veracity defaults
+    'unknown'. Verifies the schema bump is backward-compatible."""
+    from hermes_memory_provider import MnemosyneMemoryProvider
+
+    provider = MnemosyneMemoryProvider()
+    beam = MagicMock()
+    beam.remember.return_value = "mem-456"
+    provider._beam = beam
+
+    provider._handle_remember({"content": "minimal call"})
+
+    kwargs = beam.remember.call_args.kwargs
+    assert kwargs.get("extract", False) is False
+    # metadata may be None or absent; both are acceptable as "not set"
+    assert kwargs.get("metadata") in (None, {}), kwargs.get("metadata")
+    # veracity may be "unknown" (passed through) or absent (beam default)
+    assert kwargs.get("veracity", "unknown") == "unknown"
