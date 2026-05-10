@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [2.5] — 2026-05-10
+
+### Added
+
+**Self-Healing Quality Pipeline** (`scripts/heal_quality.py`)
+- Detects degraded episodic memory entries (bullet-format, <300 chars) and repairs them via a 4-stage LLM-as-Judge closed loop: Extract → Generate → Judge → Repair
+- Fault taxonomy: `truncated`, `generic`, `missing_facts`, `wrong_format`, `none`
+- Judge scores 4 dimensions (factual density, format compliance, length sufficiency, grounding) each 0-100
+- Repair strategies are fault-specific: context doubling, specificity enforcement, fact injection, format rewrite
+- Loop detection with `MAX_RETRIES` (default 3) and automatic escalation to stronger model after 2 failures
+- Quality provenance stored in `metadata_json`: `quality_score`, `judge_model`, `consolidated_at`, `fault_before_repair`, `retry_loop_count`
+- Configurable via env: `MNEMOSYNE_HEAL_JUDGE_THRESHOLD`, `MNEMOSYNE_HEAL_MAX_RETRIES`, `MNEMOSYNE_HEAL_MIN_LEN`, `MNEMOSYNE_HEAL_BUDGET`, `MNEMOSYNE_HEAL_ESCALATE_AFTER`
+- Works with any LLM backend (MiniMax M2.7 via mmx-cli, local GGUF, or remote OpenAI-compatible API)
+- CLI: `python scripts/heal_quality.py [--detect-only] [--entry-id ID] [--dry-run]`
+- Used to repair 6 entries degraded by Qwen2.5-1.5B truncation in field testing
+
 ## [2.4] — 2026-05-07
 
 ### Added
