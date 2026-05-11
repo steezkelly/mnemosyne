@@ -8,6 +8,7 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 ## [Unreleased]
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 ### Security
 
 **C25 — DeltaSync hardening (table allowlist, opt-in column allowlist, qualified SQL, per-table checkpoints)**
@@ -55,6 +56,34 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - **`truly_empty` is post-filter strict.** True only when `len(final_results) == 0` AND zero kept rows across all tiers. Distinguishes "no signal anywhere" from "candidates existed but got filtered" (top_k=0 callers, post-filter dropouts, etc.).
 - **`fallback_rate` clamped at 1.0.** Defends against a reset-mid-call race where pre-reset `record_fallback_used` calls could accumulate against a post-reset `_total_calls` counter, producing >1.0 ratios in dashboards.
 >>>>>>> pr79
+=======
+### Added
+
+**C13.b — Fact-extraction failure diagnostics**
+- New `mnemosyne.extraction.diagnostics` module exposes a process-global `ExtractionDiagnostics` instance. Pre-C13.b fact extraction had five silent-failure layers (cloud HTTP errors → `""`, JSON parse failures → `[]`, local LLM exceptions → `pass`, no-LLM-available fallback → `[]`, outer `extract_facts_safe` wrapper → `[]`). Operators got zero signal that fact-recall and the graph voice were running blind.
+- The diagnostics record each extraction attempt's outcome at every tier (`host` / `remote` / `local` / `cloud`). Counters per tier: `attempts`, `successes`, `no_output`, `failures`, plus bounded recent error samples. Bird's-eye totals: `calls`, `successes`, `failures`, `empty`, `success_rate`.
+- `mnemosyne/core/extraction.py::extract_facts` instruments every tier transition (host attempted vs. succeeded, host fallback to local, remote LLM no-output, local LLM raised, model not loaded, etc.). Each branch records to the diagnostics so operators can see exactly what's being swallowed.
+- `mnemosyne/extraction/client.py::ExtractionClient.chat` records `cloud` tier attempts, successes (non-empty response), `no_output` (empty response), and failures with the last exception. `extract_facts()` adds JSON-parse-failure recording so malformed model responses are distinguishable from "model had nothing to say."
+- New module-level helpers: `get_extraction_stats()` returns a JSON-serializable snapshot; `reset_extraction_stats()` zeroes the counters (useful for tests + operators starting a fresh measurement window).
+- WARNING-level log lines fire on the most actionable failure paths (`ExtractionClient.chat` all-models-failed, `extract_facts` local LLM raised, JSON parse failed, etc.). Diagnostics are the primary signal; logs are the secondary signal for log-tailing operators.
+
+### Notes for callers
+
+- Diagnostics are **read-only signal** — they never alter extraction behavior. Failures are still swallowed at the call site (`extract_facts_safe`, the outer `try/except: pass` in `beam.py::_extract_and_store_facts`); diagnostics surface what's being swallowed.
+- Thread-safe: a single `threading.Lock` gates all mutations. Concurrent extraction calls from different threads accumulate correctly.
+- The error-sample queue is bounded to 10 per tier; a chronically failing tier doesn't accumulate unbounded memory.
+- Long error messages are truncated to 200 chars in the captured sample to bound log volume and prevent content leakage from upstream LLM errors that include the full prompt.
+- API: `from mnemosyne.extraction import get_extraction_stats, reset_extraction_stats, get_diagnostics, ExtractionDiagnostics`.
+
+### Counter semantics (post-/review hardening)
+
+- **Tier attempt counters are conditional**, not unconditional. `record_attempt("host")` fires only when the host backend actually ran (`attempted=True` from `_try_host_llm`). Configurations with no host backend registered show zero host attempts, not phantom attempts.
+- **Tier success counters reflect parseable output, not transport success.** `ExtractionClient.chat()` records cloud-tier attempts and transport-level outcomes (`no_output` for empty HTTP, `failure` for all-models-failed) but does NOT record cloud-tier success. `ExtractionClient.extract_facts()` records `cloud_success` only after the response parses into a fact list. This means cloud `success_rate` (`successes / attempts`) reflects extraction quality, not API health.
+- **Outer-wrapper failures land on the synthetic `wrapper` tier.** `extract_facts_safe`'s outer `except` records to `wrapper` rather than `local` — pre-review the outer exceptions polluted local-tier metrics, misleading operators triaging local-LLM health. The `wrapper` tier explicitly means "tier of origin can't be determined."
+- **Host adapter exceptions land on `host` tier.** If `_try_host_llm` itself raises, the failure records under `host` with reason `host_adapter_raised` (caught at the call site) instead of escaping to the outer wrapper.
+- **Snapshot samples are independent copies.** `snapshot()` deep-copies the sample dicts so a caller mutating the returned snapshot can't mutate diagnostics' internal state.
+- **Log lines sanitize exception repr.** `_safe_for_log` strips control characters / newlines / ANSI escapes from the logged exception representation. A hostile or malformed `__repr__` can't inject log-line breaks or terminal escape sequences.
+>>>>>>> pr78
 
 ## [2.5] — 2026-05-10
 
