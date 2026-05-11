@@ -237,6 +237,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
+        self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Tracked so shutdown() can wait briefly for in-flight consolidation
         # before clearing the host LLM backend, preventing the post-timeout
         # daemon thread from racing with unregister and falling through to
@@ -284,6 +286,28 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if vector_type and vector_type not in ("float32", "int8", "bit"):
             logger.warning("Mnemosyne: unknown vector_type=%r, ignoring", vector_type)
 
+        # ignore_patterns: list of regex patterns to filter from memory storage
+        patterns = kwargs.get("ignore_patterns") or self._read_config_key("ignore_patterns")
+        if patterns:
+            if isinstance(patterns, str):
+                patterns = [p.strip() for p in patterns.replace(",", "\n").split("\n") if p.strip()]
+            elif isinstance(patterns, list):
+                patterns = [str(p).strip() for p in patterns if str(p).strip()]
+            self._ignore_patterns = patterns
+
+    def _should_filter(self, content: str) -> bool:
+        """Check if content matches any ignore pattern. Returns True if it should be skipped."""
+        if not self._ignore_patterns:
+            return False
+        import re
+        for pattern in self._ignore_patterns:
+            try:
+                if re.search(pattern, content, re.IGNORECASE):
+                    return True
+            except re.error:
+                logger.debug("Mnemosyne: invalid ignore pattern %r, skipping", pattern)
+        return False
+
     def _read_config_key(self, key: str) -> Any:
         """Read a single key from memory.mnemosyne in config.yaml."""
         try:
@@ -302,6 +326,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set true to enable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
+            {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -329,7 +354,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
 
-        if self._agent_context in ("cron", "flush", "subagent"):
+        if self._agent_context in self._skip_contexts:
             logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
             return
 
@@ -370,7 +395,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         
         Only includes memories above a relevance threshold to prevent context pollution
         from low-quality matches."""
-        if not self._beam or self._agent_context in ("cron", "flush", "subagent"):
+        if not self._beam or self._agent_context in self._skip_contexts:
             return ""
         try:
             results = self._beam.recall(query, top_k=8, temporal_weight=0.2, temporal_halflife=48)
@@ -405,17 +430,17 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist the turn to Mnemosyne episodic memory."""
-        if not self._beam or self._agent_context in ("cron", "flush", "subagent"):
+        if not self._beam or self._agent_context in self._skip_contexts:
             return
         try:
-            if user_content and len(user_content) > 5:
+            if user_content and len(user_content) > 5 and not self._should_filter(user_content):
                 self._beam.remember(
                     content=f"[USER] {user_content[:500]}",
                     source="conversation",
                     importance=0.3,
                     extract_entities=True,
                 )
-            if assistant_content and len(assistant_content) > 10:
+            if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                 self._beam.remember(
                     content=f"[ASSISTANT] {assistant_content[:800]}",
                     source="conversation",
