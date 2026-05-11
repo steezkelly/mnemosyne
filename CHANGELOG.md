@@ -30,9 +30,18 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 ### Notes for callers
 
 - Defaults are unchanged. If you don't set `MNEMOSYNE_POLYPHONIC_RECALL=1`, you get the same recall behavior as before.
-- The engine's RRF combined_score replaces the linear scorer's weighted score in the result `score` field. Score MAGNITUDES will differ between the two paths (RRF produces small positive floats from `1/(60+rank)` summed across voices; the linear scorer produces values in [0, ~1]). Rankings are the comparable signal, not absolute scores.
-- The engine doesn't currently apply the post-E4 veracity multiplier or the tier degradation multiplier. Those are linear-scorer-only modulators. Flag=ON callers wanting that scoring composition should request it as a follow-up (E5.a).
-- Fact-voice synthetic memory ids (`cf_subject_predicate_object`) are dropped from the final list — they don't correspond to actual rows. The fact voice's score signal still flows through RRF onto real memory_ids surfaced by other voices.
+- The engine's RRF combined_score replaces the linear scorer's weighted score in the result `score` field. Score MAGNITUDES will differ between the two paths (RRF produces small positive floats from `1/(60+rank)` summed across voices; the linear scorer produces values in [0, ~1]). Rankings are the comparable signal, not absolute scores. Downstream context-formatting code that uses absolute-score buckets (e.g., `>0.3` / `>0.7` thresholds in `format_context`) may need re-tuning for the engine path.
+- **Veracity and tier multipliers DO apply on the engine path** (added in the review-pass fixes). Post-RRF the `combined_score` is multiplied by the row's `VERACITY_WEIGHTS` factor and (for episodic rows) the tier degradation factor — same composition as the linear path post-E4. Initial implementation skipped this; `/review` caught it as a regression in arm signal quality.
+- **Filter enforcement matches the linear path** (review fix). Session scope, `valid_until`, `superseded_by`, and caller-supplied `from_date` / `to_date` / `source` / `topic` / `author_id` / `author_type` / `channel_id` / `veracity` / `memory_type` filters all apply post-RRF, before returning. Initial implementation bypassed these (data-isolation regression, Codex P1).
+- **`recall_count` and `last_recalled` are updated on the engine path** (review fix). Decay scheduling, importance reinforcement, and usage telemetry signals continue to work under flag=ON.
+- **The engine is lazily cached on the BeamMemory instance.** Subsystem constructors (BinaryVectorStore / EpisodicGraph / VeracityConsolidator) fire once per BeamMemory lifecycle, not per recall call. Avoids the schema-ensure + commit storm the initial implementation produced.
+- Fact-voice synthetic memory ids (`cf_subject_predicate_object`) are skipped from the final list — the engine returns the fact key, not the producing memory_id, so we can't map them back to source rows. The fact voice's score signal still flows through RRF onto real memory_ids surfaced by other voices. Mapping `cf_*` back to source memory_ids requires the engine to track sources alongside facts — filed as a follow-up.
+
+### Known limitations (E5.a follow-ups)
+
+- **Vector voice queries the wrong table.** `BinaryVectorStore.search()` reads from a standalone `binary_vectors` table. Production binary vectors live in `episodic_memory.binary_vector` (column, added by NAI-4 commit `49f2d2a`). Under flag=ON the vector voice silently returns empty — the engine effectively runs 3 voices, not 4. To fix: either route `BinaryVectorStore.search` to the episodic column, or backfill the standalone table at consolidation time. Discovered by Codex adversarial + Claude adversarial on PR #76.
+- **Fact-voice evidence mapping.** Fact-voice ids are synthetic; mapping them back to producing memory rows requires the `ConsolidatedFact.sources` list to be threaded through the engine. Currently those scores fuse via RRF onto real memory_ids only when other voices also surface them.
+- **Long-query DOS bound.** `_fact_voice` iterates over every word in the query, issuing one `get_consolidated_facts` call per word. Adversarial 10K-char queries can amplify DOS. Cap recommended (e.g., `words[:50]`).
 
 ## [2.5] — 2026-05-10
 

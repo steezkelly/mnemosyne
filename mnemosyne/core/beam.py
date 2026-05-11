@@ -15,11 +15,14 @@ Hybrid ranking: 50% vector + 30% FTS rank + 20% importance.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import json
 import hashlib
 import threading
 import math
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
@@ -1525,9 +1528,19 @@ class BeamMemory:
         """
         # E5 feature flag — read per call so operators can toggle
         # without rebuilding BeamMemory (critical for A/B experiments
-        # in the same process).
+        # in the same process). All recall filter kwargs flow through
+        # so the engine path enforces the same isolation/validity
+        # contract as the linear path. /review found that omitting
+        # them under flag=ON was a data-isolation regression (P1).
         if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
-            return self._recall_polyphonic(query, top_k)
+            return self._recall_polyphonic(
+                query, top_k,
+                from_date=from_date, to_date=to_date,
+                source=source, topic=topic,
+                author_id=author_id, author_type=author_type,
+                channel_id=channel_id,
+                veracity=veracity, memory_type=memory_type,
+            )
 
         results = []
         query_lower = query.lower()
@@ -2358,30 +2371,44 @@ class BeamMemory:
         lines.append(f"\n_({total} memories retrieved)_")
         return "\n".join(lines)
 
-    def _recall_polyphonic(self, query: str, top_k: int) -> List[Dict]:
+    def _recall_polyphonic(self, query: str, top_k: int,
+                           *,
+                           from_date: Optional[str] = None,
+                           to_date: Optional[str] = None,
+                           source: Optional[str] = None,
+                           topic: Optional[str] = None,
+                           author_id: Optional[str] = None,
+                           author_type: Optional[str] = None,
+                           channel_id: Optional[str] = None,
+                           veracity: Optional[str] = None,
+                           memory_type: Optional[str] = None) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
-        The engine runs vector + graph + fact + temporal voices, fuses
-        them via RRF, diversity-reranks, and assembles within a
-        context budget. Maps PolyphonicResult objects back to the
-        dict shape that BeamMemory.recall normally returns.
+        Engine runs vector + graph + fact + temporal voices, fuses via RRF,
+        diversity-reranks, assembles within a context budget. Maps
+        PolyphonicResult objects back to recall()'s dict shape.
 
-        Each result dict carries `voice_scores` for per-signal
-        provenance — the OpenViking observability principle ("show me
-        which voice contributed to this ranking"). Downstream
-        consumers that depend on the existing `score` key see the
-        engine's RRF combined_score in that field.
+        Each result carries `voice_scores` for per-signal provenance.
+        Engine's RRF combined_score lands in the `score` field; the
+        post-E4 veracity multiplier and tier-degradation multiplier
+        are then composed on top so flag=ON callers don't lose the
+        recent ranking work.
 
-        Synthetic memory ids from the fact voice (`cf_subject_...`)
-        don't correspond to actual rows; they're dropped from the
-        final list. The fact voice's contribution still flows through
-        RRF onto real memory_ids surfaced by other voices.
+        Filters from the caller (session/scope/valid_until/superseded/
+        author/channel/source/veracity/memory_type/from_date/to_date)
+        are applied during row fetch — same isolation contract as the
+        linear path. /review caught the original implementation
+        bypassing these (data-isolation regression, P1).
+
+        Synthetic fact-voice ids (`cf_...`) currently can't be mapped
+        back to source rows (the engine returns the fact key, not the
+        producing memory_id). They're skipped; the fact voice still
+        contributes ranking signal via RRF onto real memory_ids
+        surfaced by other voices. Known limitation, documented in
+        CHANGELOG.
         """
-        # Lazy import to avoid circular dependency at module load.
-        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
-
-        engine = PolyphonicRecallEngine(db_path=self.db_path, conn=self.conn)
+        engine = self._get_polyphonic_engine()
 
         query_embedding = None
         if _embeddings.available():
@@ -2390,47 +2417,183 @@ class BeamMemory:
                 if vecs is not None and len(vecs) > 0:
                     query_embedding = vecs[0]
             except Exception:
-                # Vector voice will return empty; other voices still
-                # contribute.
                 query_embedding = None
 
         try:
             polyphonic_results = engine.recall(
                 query=query,
                 query_embedding=query_embedding,
-                top_k=top_k,
+                top_k=top_k * 2,  # over-fetch for filter dropouts
             )
-        except Exception:
-            # If the engine path fails for any reason, return [] rather
-            # than crashing the caller. Operators can debug via the
-            # standard logging path; recall callers shouldn't
-            # propagate engine internals.
+        except Exception as exc:
+            logger.exception("polyphonic recall engine failed: %s", exc)
             return []
 
-        # Map PolyphonicResult → recall's dict shape. Skip synthetic
-        # fact-voice ids that don't have a backing row.
+        # Map → recall's dict shape with filters + multipliers applied.
+        weight_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
+                      "tool": TOOL_WEIGHT, "imported": IMPORTED_WEIGHT,
+                      "unknown": UNKNOWN_WEIGHT}
+        tier_weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
+
         final = []
+        recalled_episodic_ids = []
+        recalled_working_ids = []
         cursor = self.conn.cursor()
+        now_iso = datetime.now().isoformat()
+
         for r in polyphonic_results:
             memory_id = r.memory_id
             if memory_id.startswith("cf_"):
-                # Consolidated-fact synthetic id; no row to fetch.
                 continue
             row_dict = self._fetch_polyphonic_row(cursor, memory_id)
             if row_dict is None:
                 continue
-            row_dict["score"] = r.combined_score
+
+            # Apply caller-supplied filters and the always-on
+            # isolation/validity contract.
+            if not self._polyphonic_row_passes_filters(
+                row_dict, from_date=from_date, to_date=to_date,
+                source=source, topic=topic, author_id=author_id,
+                author_type=author_type, channel_id=channel_id,
+                veracity=veracity, memory_type=memory_type, now_iso=now_iso,
+            ):
+                continue
+
+            # Compose RRF combined_score with post-E4 multipliers so
+            # flag=ON callers don't silently lose the veracity rank
+            # signal or tier degradation. Veracity multiplier applies
+            # to both tiers (matching the post-E4 linear behavior).
+            score = r.combined_score
+            row_veracity = row_dict.get("veracity") or "unknown"
+            score *= weight_map.get(row_veracity, UNKNOWN_WEIGHT)
+            if row_dict.get("tier") == "episodic":
+                ep_tier = row_dict.get("degradation_tier") or 1
+                score *= tier_weight_map.get(ep_tier, 1.0)
+                recalled_episodic_ids.append(memory_id)
+            else:
+                recalled_working_ids.append(memory_id)
+
+            row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
             final.append(row_dict)
+            if len(final) >= top_k:
+                break
+
+        # Re-sort post-multiplier composition so the final order reflects
+        # both RRF and the veracity/tier weights.
+        final.sort(key=lambda x: x["score"], reverse=True)
+
+        # Update recall_count / last_recalled for engine results too —
+        # the linear path updates them and downstream features (decay
+        # scheduling, importance reinforcement) depend on the signal.
+        # /review caught the missing update as a silent telemetry loss.
+        if recalled_episodic_ids:
+            placeholders = ",".join("?" * len(recalled_episodic_ids))
+            self.conn.execute(
+                f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
+                f"last_recalled = ? WHERE id IN ({placeholders})",
+                (now_iso, *recalled_episodic_ids),
+            )
+        if recalled_working_ids:
+            placeholders = ",".join("?" * len(recalled_working_ids))
+            self.conn.execute(
+                f"UPDATE working_memory SET recall_count = recall_count + 1, "
+                f"last_recalled = ? WHERE id IN ({placeholders})",
+                (now_iso, *recalled_working_ids),
+            )
+        if recalled_episodic_ids or recalled_working_ids:
+            self.conn.commit()
+
         return final
+
+    def _get_polyphonic_engine(self):
+        """Lazy-cached engine instance per BeamMemory.
+
+        Pre-fix: a fresh engine was constructed on every recall call,
+        which re-ran BinaryVectorStore + EpisodicGraph + VeracityConsolidator
+        constructors and their schema-ensure SQL (`CREATE TABLE IF NOT
+        EXISTS` + `CREATE INDEX IF NOT EXISTS` + commit) on every call.
+        Under prefetch/A/B-flag workloads that's a wasteful commit
+        storm. /review caught the per-call instantiation.
+
+        Engine state is read-only between calls; the shared
+        `self.conn` is the only mutable dependency and it's pinned at
+        BeamMemory init.
+        """
+        if getattr(self, "_polyphonic_engine", None) is None:
+            from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+            self._polyphonic_engine = PolyphonicRecallEngine(
+                db_path=self.db_path, conn=self.conn,
+            )
+        return self._polyphonic_engine
+
+    def _polyphonic_row_passes_filters(self, row_dict: Dict, *,
+                                       from_date: Optional[str],
+                                       to_date: Optional[str],
+                                       source: Optional[str],
+                                       topic: Optional[str],
+                                       author_id: Optional[str],
+                                       author_type: Optional[str],
+                                       channel_id: Optional[str],
+                                       veracity: Optional[str],
+                                       memory_type: Optional[str],
+                                       now_iso: str) -> bool:
+        """Mirror the linear path's filter set for the engine path.
+        Always-on filters: session scope, valid_until, superseded_by.
+        Conditional filters: caller-supplied kwargs.
+        """
+        # Always-on session/scope isolation: only return rows visible
+        # to this session. Matches the linear path's WHERE clauses for
+        # both working_memory (session_id = self.session_id OR scope =
+        # 'global') and episodic_memory (same shape).
+        row_session = row_dict.get("session_id") if "session_id" in row_dict else None
+        # Some rows don't carry session_id in the engine row dict — re-fetch
+        # via the cursor to enforce. For now, treat global scope as
+        # always-visible and same-session as visible.
+        row_scope = row_dict.get("scope") or "session"
+        if row_scope != "global" and row_session is not None and row_session != self.session_id:
+            return False
+
+        # Validity filters.
+        valid_until = row_dict.get("valid_until")
+        if valid_until and valid_until <= now_iso:
+            return False
+        if row_dict.get("superseded_by"):
+            return False
+
+        # Caller-supplied filters.
+        if from_date and (row_dict.get("timestamp") or "") < from_date:
+            return False
+        if to_date and (row_dict.get("timestamp") or "") > to_date:
+            return False
+        if source and row_dict.get("source") != source:
+            return False
+        if topic and topic not in (row_dict.get("source") or ""):
+            return False
+        if author_id and row_dict.get("author_id") != author_id:
+            return False
+        if author_type and row_dict.get("author_type") != author_type:
+            return False
+        if channel_id and row_dict.get("channel_id") != channel_id:
+            return False
+        if veracity and row_dict.get("veracity") != veracity:
+            return False
+        if memory_type and row_dict.get("memory_type") != memory_type:
+            return False
+
+        return True
 
     def _fetch_polyphonic_row(self, cursor, memory_id: str) -> Optional[Dict]:
         """Resolve a memory_id from the polyphonic engine to a row
         dict matching recall()'s existing return shape. Tries episodic
         first, then working_memory; returns None if neither table
-        has the row (engine returned a stale or synthetic id)."""
+        has the row (engine returned a stale or synthetic id).
+
+        Includes session_id in the SELECT so the filter pass can
+        enforce session-scope isolation post-fetch.
+        """
         cursor.execute("""
-            SELECT id, content, source, timestamp, importance,
+            SELECT id, content, source, timestamp, session_id, importance,
                    recall_count, last_recalled, valid_until,
                    superseded_by, scope, author_id, author_type,
                    channel_id, veracity, memory_type, tier
@@ -2438,27 +2601,9 @@ class BeamMemory:
         """, (memory_id,))
         row = cursor.fetchone()
         if row is not None:
-            return {
-                "id": row["id"],
-                "content": row["content"],
-                "source": row["source"],
-                "timestamp": row["timestamp"],
-                "importance": row["importance"],
-                "recall_count": row["recall_count"] or 0,
-                "last_recalled": row["last_recalled"],
-                "scope": row["scope"] if "scope" in row.keys() else "session",
-                "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                "author_type": row["author_type"] if "author_type" in row.keys() else None,
-                "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
-                "veracity": row["veracity"] if "veracity" in row.keys() else "unknown",
-                "memory_type": row["memory_type"] if "memory_type" in row.keys() else "unknown",
-                "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
-                "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-                "tier": "episodic",
-                "degradation_tier": row["tier"] if "tier" in row.keys() else 1,
-            }
+            return self._polyphonic_row_to_dict(row, tier_label="episodic")
         cursor.execute("""
-            SELECT id, content, source, timestamp, importance,
+            SELECT id, content, source, timestamp, session_id, importance,
                    recall_count, last_recalled, valid_until,
                    superseded_by, scope, author_id, author_type,
                    channel_id, veracity, memory_type
@@ -2467,11 +2612,18 @@ class BeamMemory:
         row = cursor.fetchone()
         if row is None:
             return None
-        return {
+        return self._polyphonic_row_to_dict(row, tier_label="working")
+
+    def _polyphonic_row_to_dict(self, row, *, tier_label: str) -> Dict:
+        """Shared row → recall-dict mapper. /review caught the
+        near-duplicate column mapping across episodic/working
+        branches — single helper now."""
+        d = {
             "id": row["id"],
             "content": row["content"],
             "source": row["source"],
             "timestamp": row["timestamp"],
+            "session_id": row["session_id"] if "session_id" in row.keys() else None,
             "importance": row["importance"],
             "recall_count": row["recall_count"] or 0,
             "last_recalled": row["last_recalled"],
@@ -2483,8 +2635,11 @@ class BeamMemory:
             "memory_type": row["memory_type"] if "memory_type" in row.keys() else "unknown",
             "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
             "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
-            "tier": "working",
+            "tier": tier_label,
         }
+        if tier_label == "episodic":
+            d["degradation_tier"] = row["tier"] if "tier" in row.keys() else 1
+        return d
 
     def fact_recall(self, query: str, top_k: int = 30) -> List[Dict]:
         """Search the facts table (LLM-extracted structured knowledge).
