@@ -301,6 +301,62 @@ The `.audit-state.json` file follows this structure:
 
 ---
 
+## Edge Cases and Failure Modes
+
+The checkpoint system handles these edge cases automatically. When any are detected during Phase 0, the health check reports them and adjusts the audit scope.
+
+### 1. Git History Rewrite (Rebase/Squash)
+**What happens:** All git blob hashes change simultaneously after a rebase or squash merge.
+**Detection:** If ALL tracked file hashes differ from audited hashes at once, the checkpoint flags `_rebase_detected: true`.
+**Action:** Full re-audit of all pages. The old audit data is preserved as historical context but all pages are re-verified.
+
+### 2. Checkpoint File Missing or Corrupted
+**What happens:** `.audit-state.json` is deleted, has malformed JSON, or is missing required fields.
+**Detection:** JSON parse fails or `_schema` field is missing/wrong version.
+**Action:** Full audit of all pages. New checkpoint generated from scratch.
+
+### 3. Page Renamed or Moved
+**What happens:** A file is renamed (e.g., `old-name.mdx` → `new-name.mdx`). The old path disappears and a new path appears.
+**Detection:** Old path shows `status: gone`. New path shows `status: unaudited`.
+**Action:** The old entry is kept with `status: gone` for historical tracking. The new path gets a full audit. If git detected the rename, the agent can optionally carry forward the audit status.
+
+### 4. Mirror Drift (Source and Mirror Out of Sync)
+**What happens:** Someone edits `content/foo.mdx` but forgets to sync `src/app/(docs)/foo/page.mdx`. The hashes diverge.
+**Detection:** Mirror hash differs from its source hash while both are marked `clean`.
+**Action:** Mark mirror as `status: drifted`. Sync it from source before auditing. The drifted status prevents skipping a stale mirror.
+
+### 5. Codebase Version Bump
+**What happens:** Mnemosyne upgrades from v2.5.0 to v2.6.0. Doc pages were audited against v2.5.0.
+**Detection:** `codebase_version` in checkpoint differs from current `mnemosyne.__version__`.
+**Action:** All source pages marked `status: stale_version`. They need re-verification even if content hasn't changed — API signatures, tool counts, or config keys may have changed.
+
+### 6. Concurrent Edits During Audit
+**What happens:** Someone pushes a doc change while the audit is running.
+**Detection:** At end of Phase 5 (before commit), re-check git hashes of all audited files. If any differ from what was audited, flag as `possibly_stale`.
+**Action:** Re-audit those specific files before finalizing the checkpoint.
+
+### 7. Partial Audits (Only Some Pages Audited This Round)
+**What happens:** User requests audit of only specific pages, not the full site.
+**Detection:** Some pages have newer `last_audited` dates than others.
+**Action:** The checkpoint tracks per-page status independently. Each page's `audit_hash` is its own truth. No global consistency issue — this is by design.
+
+### 8. Pages Deleted from Docs Site
+**What happens:** A page is removed from the repo entirely.
+**Detection:** File path exists in checkpoint but not in current `git ls-tree`.
+**Action:** Mark as `status: gone` with a note about when it disappeared. Kept for audit trail. Remove from checkpoint after 3 audit cycles (manual cleanup or automatic).
+
+### 9. Untracked Pages (Never Audited)
+**What happens:** Pages exist in the repo but were never added to the checkpoint.
+**Detection:** File exists in `git ls-tree` but not in checkpoint's `files` dict.
+**Action:** Added with `status: unaudited`. Prioritized for audit on next run. The health check reports how many remain.
+
+### 10. Agent Fixes Introduce New Issues
+**What happens:** During Phase 4, fixing one discrepancy accidentally breaks something else (e.g., wrong method name propagated to multiple places).
+**Detection:** Phase 5 verification step — after all fixes, re-run key cross-reference checks on the fixed pages.
+**Action:** If new issues found, fix them in the same audit cycle. The checkpoint only gets updated after all issues are resolved.
+
+---
+
 ## Phase 6: Website Cross-Check (5 min)
 
 - [ ] `mnemosyne-website/src/components/HomePage.tsx` — BEAM labels still correct
