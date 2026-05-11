@@ -25,6 +25,15 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - Long error messages are truncated to 200 chars in the captured sample to bound log volume and prevent content leakage from upstream LLM errors that include the full prompt.
 - API: `from mnemosyne.extraction import get_extraction_stats, reset_extraction_stats, get_diagnostics, ExtractionDiagnostics`.
 
+### Counter semantics (post-/review hardening)
+
+- **Tier attempt counters are conditional**, not unconditional. `record_attempt("host")` fires only when the host backend actually ran (`attempted=True` from `_try_host_llm`). Configurations with no host backend registered show zero host attempts, not phantom attempts.
+- **Tier success counters reflect parseable output, not transport success.** `ExtractionClient.chat()` records cloud-tier attempts and transport-level outcomes (`no_output` for empty HTTP, `failure` for all-models-failed) but does NOT record cloud-tier success. `ExtractionClient.extract_facts()` records `cloud_success` only after the response parses into a fact list. This means cloud `success_rate` (`successes / attempts`) reflects extraction quality, not API health.
+- **Outer-wrapper failures land on the synthetic `wrapper` tier.** `extract_facts_safe`'s outer `except` records to `wrapper` rather than `local` — pre-review the outer exceptions polluted local-tier metrics, misleading operators triaging local-LLM health. The `wrapper` tier explicitly means "tier of origin can't be determined."
+- **Host adapter exceptions land on `host` tier.** If `_try_host_llm` itself raises, the failure records under `host` with reason `host_adapter_raised` (caught at the call site) instead of escaping to the outer wrapper.
+- **Snapshot samples are independent copies.** `snapshot()` deep-copies the sample dicts so a caller mutating the returned snapshot can't mutate diagnostics' internal state.
+- **Log lines sanitize exception repr.** `_safe_for_log` strips control characters / newlines / ANSI escapes from the logged exception representation. A hostile or malformed `__repr__` can't inject log-line breaks or terminal escape sequences.
+
 ## [2.5] — 2026-05-10
 
 ### Added

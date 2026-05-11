@@ -54,7 +54,9 @@ class TestExtractionDiagnosticsClass:
     refactors can't quietly break the recording contract."""
 
     def test_tier_constants_are_canonical(self):
-        assert EXTRACTION_TIERS == ("host", "remote", "local", "cloud")
+        # `wrapper` synthetic tier added in review-pass for outer-
+        # wrapper exceptions whose origin can't be determined.
+        assert EXTRACTION_TIERS == ("host", "remote", "local", "cloud", "wrapper")
 
     def test_snapshot_initial_state(self):
         diag = ExtractionDiagnostics()
@@ -370,8 +372,9 @@ class TestExtractFactsIntegration:
 
     def test_extract_facts_safe_wraps_outer_exceptions(self, monkeypatch):
         """If extract_facts() itself raises (rare — bug, not LLM
-        failure), extract_facts_safe records it as `local` tier
-        outer_wrapper_caught so operators can spot the bug class."""
+        failure), extract_facts_safe records it as `wrapper` tier
+        outer_wrapper_caught so operators can spot the bug class
+        without polluting local-tier metrics."""
         from mnemosyne.core import extraction as ext_mod
 
         def boom(text):
@@ -382,10 +385,12 @@ class TestExtractFactsIntegration:
         assert result == []
 
         snap = get_extraction_stats()
-        local = snap["by_tier"]["local"]
-        assert local["failures"] >= 1
-        msgs = [s.get("msg", "") + " " + s.get("reason", "") for s in local["error_samples"]]
-        assert any("outer_wrapper_caught" in m for m in msgs)
+        wrapper = snap["by_tier"]["wrapper"]
+        assert wrapper["failures"] >= 1
+        reasons = [s.get("reason", "") for s in wrapper["error_samples"]]
+        assert "outer_wrapper_caught" in reasons
+        # And local should NOT have been touched.
+        assert snap["by_tier"]["local"]["failures"] == 0
 
 
 class TestExtractionClientIntegration:
@@ -412,7 +417,13 @@ class TestExtractionClientIntegration:
         samples = cloud["error_samples"]
         assert any("401" in s.get("msg", "") for s in samples)
 
-    def test_chat_records_success(self, monkeypatch):
+    def test_chat_records_attempt_not_success(self, monkeypatch):
+        """[Review hardening] chat() records the API-transport
+        attempt but NOT cloud-tier success. Success is gated on
+        parseable output, decided by extract_facts() — not by HTTP
+        returning content. Pre-fix chat() recorded success on any
+        non-empty response, which double-counted when extract_facts
+        then failed to parse."""
         from mnemosyne.extraction.client import ExtractionClient
 
         client = ExtractionClient(api_key="key")
@@ -426,7 +437,14 @@ class TestExtractionClientIntegration:
         assert "Alice" in result
 
         snap = get_extraction_stats()
-        assert snap["by_tier"]["cloud"]["successes"] >= 1
+        # chat() ran once.
+        assert snap["by_tier"]["cloud"]["attempts"] >= 1
+        # But chat() does NOT decide cloud success — only
+        # extract_facts() does, based on parsed output.
+        assert snap["by_tier"]["cloud"]["successes"] == 0, (
+            "chat() must not record cloud-tier success — that's "
+            "extract_facts()'s job after parsing"
+        )
 
     def test_extract_facts_records_json_parse_failure(self, monkeypatch):
         """Cloud LLM returned text, but it didn't parse as a fact
@@ -478,6 +496,213 @@ class TestExtractionClientIntegration:
         cloud = snap["by_tier"]["cloud"]
         reasons = [s.get("reason", "") for s in cloud["error_samples"]]
         assert "json_parse_failed" in reasons
+
+
+class TestReviewHardening:
+    """Findings from /review (Codex structured + Codex adv +
+    Claude adv + maintainability specialist). Each test pins one of
+    the closed bypass paths."""
+
+    def test_host_attempt_not_counted_when_host_disabled(self, monkeypatch):
+        """[Codex P2, Codex adv #1, Claude adv #2] Pre-fix
+        `record_attempt("host")` fired unconditionally — every call
+        showed a phantom host attempt even when no host backend is
+        registered. Fix: record only when `attempted=True`."""
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm.llm_available", lambda: True
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm._try_host_llm",
+            lambda prompt, max_tokens, temperature: (False, ""),
+        )
+        monkeypatch.setattr("mnemosyne.core.local_llm.LLM_ENABLED", False)
+        monkeypatch.setattr("mnemosyne.core.local_llm._load_llm", lambda: None)
+
+        from mnemosyne.core.extraction import extract_facts
+        extract_facts("Alice prefers tea.")
+
+        snap = get_extraction_stats()
+        # Host should NOT show an attempt — the backend wasn't registered.
+        assert snap["by_tier"]["host"]["attempts"] == 0, (
+            f"phantom host attempt recorded: {snap['by_tier']['host']}"
+        )
+        # Local DID attempt (the actual code path that ran).
+        assert snap["by_tier"]["local"]["attempts"] >= 1
+
+    def test_host_adapter_exception_recorded_on_host_tier(self, monkeypatch):
+        """[Claude adv #2] If `_try_host_llm` raises, record on host
+        tier (with reason `host_adapter_raised`) NOT propagate to
+        extract_facts_safe which would misattribute to wrapper tier."""
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm.llm_available", lambda: True
+        )
+
+        def host_raises(*args, **kwargs):
+            raise RuntimeError("host adapter crashed")
+
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm._try_host_llm", host_raises
+        )
+
+        from mnemosyne.core.extraction import extract_facts
+        result = extract_facts("Alice prefers tea.")
+        assert result == []
+
+        snap = get_extraction_stats()
+        host = snap["by_tier"]["host"]
+        assert host["failures"] >= 1
+        reasons = [s.get("reason", "") for s in host["error_samples"]]
+        assert "host_adapter_raised" in reasons
+
+    def test_outer_wrapper_failure_attributed_to_wrapper_tier(self, monkeypatch):
+        """[Claude adv #11] extract_facts_safe's outer except records
+        on the synthetic `wrapper` tier, not `local`. Pre-fix this
+        polluted local-tier metrics with failures from any layer."""
+        from mnemosyne.core import extraction as ext_mod
+
+        def boom(text):
+            raise TypeError("simulated extract_facts bug")
+
+        monkeypatch.setattr(ext_mod, "extract_facts", boom)
+        ext_mod.extract_facts_safe("any content")
+
+        snap = get_extraction_stats()
+        # wrapper tier is the new home.
+        wrapper = snap["by_tier"]["wrapper"]
+        assert wrapper["failures"] >= 1
+        # local tier should NOT have been touched by the wrapper case.
+        assert snap["by_tier"]["local"]["failures"] == 0
+
+    def test_cloud_chat_does_not_record_success_on_unparseable_text(
+        self, monkeypatch
+    ):
+        """[Codex P2 #3, Codex adv #2] Pre-fix chat() recorded
+        success on non-empty HTTP, then extract_facts recorded
+        failure on JSON parse — double-counting. Fix: chat() never
+        records cloud-tier success; only extract_facts decides based
+        on parseable output."""
+        from mnemosyne.extraction.client import ExtractionClient
+
+        client = ExtractionClient(api_key="key")
+        # Return text WITHOUT a JSON array.
+        monkeypatch.setattr(
+            client,
+            "_call_api",
+            lambda *a, **kw: "I cannot extract facts from this text.",
+        )
+
+        result = client.extract_facts(
+            [{"role": "user", "content": "some content"}]
+        )
+        assert result == []
+
+        snap = get_extraction_stats()
+        cloud = snap["by_tier"]["cloud"]
+        # Cloud-tier success counter MUST NOT have incremented —
+        # the chat returned text but extraction yielded no facts.
+        assert cloud["successes"] == 0, (
+            f"cloud success counter incremented despite no parseable "
+            f"facts: {cloud}"
+        )
+        # And there should be a failure recorded for no parseable
+        # output.
+        reasons = [s.get("reason", "") for s in cloud["error_samples"]]
+        assert "no_facts_in_response" in reasons
+
+    def test_cloud_extract_facts_records_record_call(self, monkeypatch):
+        """[Codex P2 #2, Codex adv #3] ExtractionClient.extract_facts
+        now records record_call() so totals.calls / success_rate
+        reflect the cloud path. Pre-fix the cloud path was excluded
+        from bird's-eye accounting."""
+        from mnemosyne.extraction.client import ExtractionClient
+
+        client = ExtractionClient(api_key="key")
+        monkeypatch.setattr(
+            client,
+            "_call_api",
+            lambda *a, **kw: '[{"subject":"Alice","predicate":"prefers","object":"tea"}]',
+        )
+
+        # Pre-call: zero totals.
+        pre = get_extraction_stats()
+        assert pre["totals"]["calls"] == 0
+
+        result = client.extract_facts(
+            [{"role": "user", "content": "Alice prefers tea"}]
+        )
+        assert len(result) == 1
+
+        post = get_extraction_stats()
+        # Outer call counted, success at totals level.
+        assert post["totals"]["calls"] == 1
+        assert post["totals"]["successes"] == 1
+        # And cloud-tier success counted too.
+        assert post["by_tier"]["cloud"]["successes"] >= 1
+
+    def test_snapshot_samples_are_independent_copies(self, monkeypatch):
+        """[Codex adv #4] snapshot() must return a deep-enough copy
+        that the caller mutating the returned dict can't mutate
+        internal diagnostics state. Pre-fix list(deque) aliased the
+        sample dicts."""
+        diag = ExtractionDiagnostics()
+        try:
+            raise ValueError("test error")
+        except Exception as e:
+            diag.record_failure("cloud", exc=e)
+
+        snap = diag.snapshot()
+        # Mutate the returned sample.
+        snap["by_tier"]["cloud"]["error_samples"][0]["msg"] = "MUTATED"
+
+        # Re-snapshot — original must NOT carry the mutation.
+        snap2 = diag.snapshot()
+        sample = snap2["by_tier"]["cloud"]["error_samples"][0]
+        assert sample["msg"] != "MUTATED", (
+            "snapshot returned aliased sample dicts; caller mutation "
+            "leaked into internal state"
+        )
+
+    def test_log_sanitizes_newlines_in_exception_repr(self, monkeypatch, caplog):
+        """[Codex adv #5] A custom exception with newlines or ANSI
+        escapes in its __repr__ would inject log-line breaks /
+        terminal control sequences if logged raw. Fix: _safe_for_log
+        sanitizes to a bounded single-line string."""
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm.llm_available", lambda: True
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm._try_host_llm",
+            lambda prompt, max_tokens, temperature: (False, ""),
+        )
+        monkeypatch.setattr("mnemosyne.core.local_llm.LLM_ENABLED", False)
+
+        class EvilError(Exception):
+            def __repr__(self):
+                return "EvilError(\nLINE\x1b[31mANSI\nINJECTED\n)"
+
+        def boom(*args, **kwargs):
+            raise EvilError()
+
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm._load_llm", lambda: boom
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mnemosyne.core.extraction"):
+            from mnemosyne.core.extraction import extract_facts
+            extract_facts("test content")
+
+        # Find the WARNING log record.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings, "no warning logged"
+        msg = warnings[-1].message
+        # No raw newlines or ANSI sequences should appear in the
+        # logged message body.
+        assert "\n" not in msg.replace("\\n", ""), (
+            f"raw newline in log message: {msg!r}"
+        )
+        assert "\x1b" not in msg, (
+            f"raw ANSI escape in log message: {msg!r}"
+        )
 
 
 class TestOperatorVisibleLogs:

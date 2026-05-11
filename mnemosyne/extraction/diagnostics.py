@@ -51,7 +51,29 @@ _ERROR_MESSAGE_CAP = 200
 # OpenAI-compatible remote endpoint, the local ctransformers GGUF
 # model, or the cloud OpenRouter ExtractionClient. Operators look at
 # per-tier success rates to know where to invest fix effort.
-EXTRACTION_TIERS = ("host", "remote", "local", "cloud")
+#
+# `wrapper` is a synthetic tier for failures that escaped through the
+# `extract_facts_safe` outer try/except whose tier of origin can't be
+# determined post-hoc. /review caught the prior pattern of attributing
+# every outer-wrapper failure to `local` — that inflated `local`'s
+# failure count and misled operators about local-LLM health.
+EXTRACTION_TIERS = ("host", "remote", "local", "cloud", "wrapper")
+
+
+def _safe_for_log(value) -> str:
+    """[C13.b /review] Sanitize a string for log inclusion. Strips
+    control characters / newlines that a hostile or malformed
+    exception `__repr__` could inject into log aggregators, and caps
+    length. Returns a single-line representation."""
+    if value is None:
+        return ""
+    s = str(value)
+    # Replace newlines, tabs, and other control chars with spaces.
+    sanitized = "".join(
+        c if (c.isprintable() and c != "\x1b") else " "
+        for c in s
+    )
+    return sanitized[:200]
 
 
 @dataclass
@@ -140,26 +162,21 @@ class ExtractionDiagnostics:
         with self._lock:
             stats = self._tier_stats[tier]
             stats.failures += 1
+            sample = {"at": datetime.now().isoformat()}
             if exc is not None:
-                sample = {
-                    "at": datetime.now().isoformat(),
-                    "type": type(exc).__name__,
-                    "msg": self._truncate_error(repr(exc)),
-                }
-                if reason:
-                    sample["reason"] = reason
+                sample["type"] = type(exc).__name__
+                sample["msg"] = self._truncate_error(repr(exc))
             elif reason is not None:
-                sample = {
-                    "at": datetime.now().isoformat(),
-                    "type": "reason",
-                    "msg": reason,
-                }
+                sample["type"] = "reason"
+                sample["msg"] = self._truncate_error(reason)
             else:
-                sample = {
-                    "at": datetime.now().isoformat(),
-                    "type": "unspecified",
-                    "msg": "",
-                }
+                sample["type"] = "unspecified"
+                sample["msg"] = ""
+            # Always include `reason` when supplied so operators
+            # alerting on a specific reason string can find it
+            # regardless of whether an exception was also captured.
+            if reason is not None:
+                sample["reason"] = reason
             stats.error_samples.append(sample)
 
     def record_call(self, *, succeeded: bool, all_empty: bool = False) -> None:
@@ -217,12 +234,15 @@ class ExtractionDiagnostics:
             by_tier = {}
             for tier in EXTRACTION_TIERS:
                 stats = self._tier_stats[tier]
+                # Deep-copy the sample dicts so a caller mutating
+                # the snapshot can't mutate the diagnostics' internal
+                # state. /review caught the alias.
                 by_tier[tier] = {
                     "attempts": stats.attempts,
                     "successes": stats.successes,
                     "no_output": stats.no_output,
                     "failures": stats.failures,
-                    "error_samples": list(stats.error_samples),
+                    "error_samples": [dict(s) for s in stats.error_samples],
                 }
             rate = 0.0 if self._total_calls == 0 else (
                 self._total_successes / self._total_calls

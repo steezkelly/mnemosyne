@@ -96,9 +96,11 @@ def extract_facts(text: str) -> List[str]:
           `mnemosyne.extraction.get_extraction_stats()` to see why
           extraction is producing empty results.
     """
-    # Lazy import to avoid pulling the diagnostics chain at module load
-    # (extraction.py is imported very early in some test contexts).
-    from mnemosyne.extraction.diagnostics import get_diagnostics
+    # Lazy import to avoid a circular dependency: mnemosyne.extraction
+    # re-exports diagnostics, and tests/core import extraction.py very
+    # early; importing diagnostics at module load would tangle the
+    # init order. After first call sys.modules caches the import.
+    from mnemosyne.extraction.diagnostics import get_diagnostics, _safe_for_log as diagnostics_safe_for_log
     diag = get_diagnostics()
 
     if not text or not text.strip():
@@ -117,11 +119,32 @@ def extract_facts(text: str) -> List[str]:
 
     # 0. Host backend (deterministic; temperature=0.0).
     # Reference live module values so monkeypatch on local_llm reaches us.
-    diag.record_attempt("host")
-    attempted, host_text = local_llm._try_host_llm(
-        prompt, max_tokens=local_llm.LLM_MAX_TOKENS, temperature=0.0
-    )
+    #
+    # /review fix: record host attempt ONLY when the host backend
+    # actually ran (`attempted=True`). Pre-fix every call incremented
+    # the host counter, including configurations with no host backend
+    # registered — phantom attempts polluted the metric. Plus wrap
+    # the call so an exception inside _try_host_llm gets attributed
+    # to host instead of escaping to the outer wrapper.
+    try:
+        attempted, host_text = local_llm._try_host_llm(
+            prompt, max_tokens=local_llm.LLM_MAX_TOKENS, temperature=0.0
+        )
+    except Exception as e:
+        # Host adapter itself raised — count as host failure rather
+        # than letting it escape to the outer wrapper where it'd be
+        # misattributed to a generic tier.
+        diag.record_attempt("host")
+        diag.record_failure("host", exc=e, reason="host_adapter_raised")
+        diag.record_call(succeeded=False)
+        logger.warning(
+            "extract_facts: host LLM adapter raised: %s",
+            diagnostics_safe_for_log(e),
+        )
+        return []
+
     if attempted:
+        diag.record_attempt("host")
         if host_text:
             facts = _parse_facts(host_text)
             if facts:
@@ -133,7 +156,16 @@ def extract_facts(text: str) -> List[str]:
             diag.record_no_output("host")
         # Host attempted but produced no facts. Skip remote per A3; try local.
         diag.record_attempt("local")
-        llm = local_llm._load_llm()
+        try:
+            llm = local_llm._load_llm()
+        except Exception as e:
+            diag.record_failure("local", exc=e, reason="load_llm_raised")
+            logger.warning(
+                "extract_facts: _load_llm raised: %s",
+                diagnostics_safe_for_log(e),
+            )
+            diag.record_call(succeeded=False)
+            return []
         if llm is not None:
             try:
                 raw_output = llm(
@@ -152,7 +184,8 @@ def extract_facts(text: str) -> List[str]:
             except Exception as e:
                 diag.record_failure("local", exc=e, reason="ctransformers_raised")
                 logger.warning(
-                    "extract_facts: local LLM raised on host-fallback path: %r", e
+                    "extract_facts: local LLM raised on host-fallback path: %s",
+                    diagnostics_safe_for_log(e),
                 )
                 diag.record_call(succeeded=False)
                 return []
@@ -165,7 +198,15 @@ def extract_facts(text: str) -> List[str]:
     # _call_remote_llm with summarize_memories' default of 0.3).
     if local_llm.LLM_ENABLED and local_llm.LLM_BASE_URL:
         diag.record_attempt("remote")
-        raw_output = local_llm._call_remote_llm(prompt, temperature=0.0)
+        try:
+            raw_output = local_llm._call_remote_llm(prompt, temperature=0.0)
+        except Exception as e:
+            diag.record_failure("remote", exc=e, reason="remote_call_raised")
+            logger.warning(
+                "extract_facts: remote LLM raised: %s",
+                diagnostics_safe_for_log(e),
+            )
+            raw_output = ""
         if raw_output:
             facts = _parse_facts(local_llm._clean_output(raw_output))
             if facts:
@@ -178,7 +219,16 @@ def extract_facts(text: str) -> List[str]:
 
     # 2. Local LLM.
     diag.record_attempt("local")
-    llm = local_llm._load_llm()
+    try:
+        llm = local_llm._load_llm()
+    except Exception as e:
+        diag.record_failure("local", exc=e, reason="load_llm_raised")
+        logger.warning(
+            "extract_facts: _load_llm raised: %s",
+            diagnostics_safe_for_log(e),
+        )
+        diag.record_call(succeeded=False)
+        return []
     if llm is not None:
         try:
             raw_output = llm(
@@ -197,7 +247,8 @@ def extract_facts(text: str) -> List[str]:
         except Exception as e:
             diag.record_failure("local", exc=e, reason="ctransformers_raised")
             logger.warning(
-                "extract_facts: local LLM raised: %r", e
+                "extract_facts: local LLM raised: %s",
+                diagnostics_safe_for_log(e),
             )
             diag.record_call(succeeded=False)
             return []
@@ -213,20 +264,24 @@ def extract_facts_safe(text: str) -> List[str]:
     Wrapper for extract_facts with exception handling.
 
     [C13.b] Outer-wrapper failures (anything `extract_facts` lets
-    escape) are recorded as `local` tier failures with reason
-    `outer_wrapper_caught` so operators can see what's slipping
-    past the inner instrumentation.
+    escape) are recorded under the synthetic `wrapper` tier with
+    reason `outer_wrapper_caught`. /review caught the prior pattern
+    of misattributing these to `local` — that inflated the local
+    tier's failure count and misled operators triaging local-LLM
+    health. The `wrapper` tier is explicitly for "tier of origin
+    can't be determined" failures.
     """
     try:
         return extract_facts(text)
     except Exception as e:
-        from mnemosyne.extraction.diagnostics import get_diagnostics
+        from mnemosyne.extraction.diagnostics import get_diagnostics, _safe_for_log
         diag = get_diagnostics()
         diag.record_failure(
-            "local", exc=e, reason="outer_wrapper_caught"
+            "wrapper", exc=e, reason="outer_wrapper_caught"
         )
         diag.record_call(succeeded=False)
         logger.warning(
-            "extract_facts_safe: extract_facts() raised: %r", e
+            "extract_facts_safe: extract_facts() raised: %s",
+            _safe_for_log(e),
         )
         return []
