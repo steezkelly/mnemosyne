@@ -4,7 +4,7 @@ Mnemosyne Polyphonic Recall Engine
 Multi-strategy parallel retrieval with deterministic re-ranking.
 
 Strategies (4 voices):
-1. Vector voice: Binary vector similarity (Phase 2)
+1. Vector voice: Dense semantic similarity over working_memory + episodic_memory
 2. Graph voice: Episodic graph traversal (Phase 3)
 3. Fact voice: Structured fact matching (Phase 4)
 4. Temporal voice: Time-aware scoring
@@ -21,15 +21,19 @@ Building on:
 - Our novel deterministic combination
 """
 
+import json
 import sqlite3
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    import numpy as np
+except ImportError:  # numpy is required by other voices too; guard for parity
+    np = None
+
 from mnemosyne.core.typed_memory import classify_memory, MemoryType, get_type_priority
-from mnemosyne.core.binary_vectors import BinaryVectorStore
 from mnemosyne.core.episodic_graph import EpisodicGraph
 from mnemosyne.core.veracity_consolidation import VeracityConsolidator
 
@@ -83,7 +87,11 @@ class PolyphonicRecallEngine:
 
         # Initialize subsystems. Each accepts an optional conn= since
         # 9f96ded; pass through so they share our handle.
-        self.vector_store = BinaryVectorStore(db_path=self.db_path, conn=conn)
+        # NOTE: vector_store removed. The vector voice now reads dense
+        # embeddings from `memory_embeddings` (the production-canonical
+        # store also used by the linear recall path), not from the
+        # standalone `binary_vectors` table which production never wrote
+        # to. See _vector_voice for the rewired query path.
         self.graph = EpisodicGraph(db_path=self.db_path, conn=conn)
         self.consolidator = VeracityConsolidator(db_path=self.db_path, conn=conn)
 
@@ -128,27 +136,111 @@ class PolyphonicRecallEngine:
         
         return context
     
-    def _vector_voice(self, query_embedding: np.ndarray) -> List[RecallResult]:
+    def _vector_voice(self, query_embedding) -> List[RecallResult]:
         """
-        Voice 1: Binary vector similarity.
-        
-        Uses information-theoretic binary vectors for fast,
-        deterministic similarity search.
+        Voice 1: Dense semantic similarity over WM + EM.
+
+        Queries the production-canonical dense embedding store
+        (`memory_embeddings`) — the same source the linear recall path
+        uses via `_wm_vec_search` / `_in_memory_vec_search` in beam.py.
+        Pre-fix this voice queried the standalone `binary_vectors` table
+        which production never wrote to (NAI-4 wrote binary vectors as a
+        column on episodic_memory, NOT to that table); the result was a
+        silently-empty vector voice and a 3-voice polyphonic engine.
+
+        Returning to a single source of truth across the recall stack
+        matches the cross-system convergence pattern (Hindsight, mem0,
+        Zep, Cognee, Letta all use one dense store shared by every
+        retrieval path) and makes polyphonic-vs-linear comparisons
+        apples-to-apples for the BEAM-recovery experiment.
+
+        Reads both WM and EM tiers, filters out invalidated /
+        superseded rows (mirror of `_wm_vec_search` WHERE clauses), and
+        ranks by cosine similarity computed in numpy. Performance is
+        bounded by linear cosine over the joined memory_embeddings rows
+        (same shape as the existing linear fallback); on databases
+        sized for the BEAM benchmark we expect this to land in the
+        same order of magnitude as the linear path's WM/EM vec search.
         """
-        if query_embedding is None:
+        if query_embedding is None or np is None:
             return []
-        
-        results = self.vector_store.search(query_embedding, top_k=20)
-        
-        return [
-            RecallResult(
-                memory_id=r["memory_id"],
-                score=r["score"],
-                voice="vector",
-                metadata={"distance": r["distance"]}
-            )
-            for r in results
-        ]
+
+        query_embedding = np.asarray(query_embedding, dtype=np.float32)
+        if query_embedding.size == 0:
+            return []
+        query_norm = float(np.linalg.norm(query_embedding))
+        if query_norm == 0.0:
+            return []
+        query_unit = query_embedding / query_norm
+
+        if self.conn is not None:
+            conn = self.conn
+            own_conn = False
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            own_conn = True
+        try:
+            results: List[RecallResult] = []
+            now_iso = datetime.now().isoformat()
+
+            # --- WM tier ---
+            # Same WHERE clause shape as beam._wm_vec_search: skip
+            # invalidated / superseded rows so vector voice never
+            # surfaces ghost rows the linear path would have hidden.
+            try:
+                wm_rows = conn.execute("""
+                    SELECT wm.id AS memory_id, me.embedding_json
+                    FROM memory_embeddings me
+                    JOIN working_memory wm ON me.memory_id = wm.id
+                    WHERE wm.superseded_by IS NULL
+                      AND (wm.valid_until IS NULL OR wm.valid_until > ?)
+                    LIMIT 50000
+                """, (now_iso,)).fetchall()
+            except sqlite3.OperationalError:
+                wm_rows = []
+
+            # --- EM tier ---
+            try:
+                em_rows = conn.execute("""
+                    SELECT em.id AS memory_id, me.embedding_json
+                    FROM memory_embeddings me
+                    JOIN episodic_memory em ON me.memory_id = em.id
+                    LIMIT 50000
+                """).fetchall()
+            except sqlite3.OperationalError:
+                em_rows = []
+
+            for tier, rows in (("working", wm_rows), ("episodic", em_rows)):
+                for row in rows:
+                    try:
+                        memory_id = row["memory_id"]
+                        embedding_json = row["embedding_json"]
+                        if not embedding_json:
+                            continue
+                        vec = np.asarray(
+                            json.loads(embedding_json), dtype=np.float32
+                        )
+                        vec_norm = float(np.linalg.norm(vec))
+                        if vec_norm == 0.0:
+                            continue
+                        sim = float(np.dot(query_unit, vec / vec_norm))
+                        results.append(RecallResult(
+                            memory_id=memory_id,
+                            score=sim,
+                            voice="vector",
+                            metadata={"similarity": sim, "tier": tier},
+                        ))
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        # Defensive: bad / unparseable embedding_json
+                        # rows shouldn't break the voice.
+                        continue
+
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results[:20]
+        finally:
+            if own_conn:
+                conn.close()
     
     def _graph_voice(self, query: str) -> List[RecallResult]:
         """
@@ -405,16 +497,25 @@ class PolyphonicRecallEngine:
     
     def get_stats(self) -> Dict:
         """Get engine statistics."""
+        # vector voice now queries memory_embeddings directly; surface
+        # the count of embedded rows as the vector-voice signal-of-life.
+        vec_count = 0
+        if self.conn is not None:
+            try:
+                vec_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                vec_count = 0
         return {
             "voice_weights": self.voice_weights,
-            "vector_stats": self.vector_store.get_stats(),
+            "vector_stats": {"embedded_rows": vec_count},
             "graph_stats": self.graph.get_stats(),
             "consolidation_stats": self.consolidator.get_stats(),
         }
-    
+
     def close(self):
         """Close all connections."""
-        self.vector_store.close()
         self.graph.close()
         self.consolidator.close()
 
