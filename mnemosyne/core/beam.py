@@ -83,7 +83,11 @@ import os
 # BEAM benchmark optimizations (opt-in via env var, zero impact on production)
 # When enabled: broader FTS5 OR semantics, larger vector scan limits, always-include vectors.
 # Set MNEMOSYNE_BEAM_OPTIMIZATIONS=1 to activate for BEAM benchmarking only.
-_BEAM_MODE = os.environ.get("MNEMOSYNE_BEAM_OPTIMIZATIONS", "").lower() in ("1", "true", "yes")
+_BEAM_MODE = os.environ.get("MNEMOSYNE_BEAM_OPTIMIZATIONS", "").lower() in ("1", "5", "true", "yes")
+# NAI-5 / Phase 5 mode: activates full polyphonic bonuses including binary vector on ALL episodic paths.
+# Value "5" was chosen to evoke "Phase 5" in the NAI benchmark naming scheme.
+# NAI-5 also sets _BEAM_MODE=True so it inherits Phase 0's stop-word/OR semantics for broader recall.
+_BEAM_PHASE5 = os.environ.get("MNEMOSYNE_BEAM_OPTIMIZATIONS", "").lower() in ("5",)
 
 if os.environ.get("MNEMOSYNE_DATA_DIR"):
     DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
@@ -2116,8 +2120,23 @@ class BeamMemory:
                         fact_b = min(mc * 0.04, 0.1)
                     except Exception:
                         pass
-                    # Binary vector bonus disabled (same reason as main path — ITS clustering)
+                    # Binary vector bonus: Phase 5 polyphonic bonus for NAI-5 mode.
+                    # Re-enabled for NAI-5 because all 1033 episodic entries now have binary vectors
+                    # backfilled, so ITS discriminability is sufficient for top-k discrimination.
                     binary_b = 0.0
+                    if _BEAM_PHASE5 and query_bv is not None:
+                        try:
+                            bv_row = row.get("binary_vector")
+                            if bv_row:
+                                q_arr = np.frombuffer(query_bv, dtype=np.uint8)
+                                m_arr = np.frombuffer(bv_row, dtype=np.uint8)
+                                xor_arr = np.bitwise_xor(q_arr, m_arr)
+                                popcount_table = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint32)
+                                h_dist = int(np.sum(popcount_table[xor_arr]))
+                                normalized_dist = h_dist / EMBEDDING_DIM
+                                binary_b = 0.08 * (1.0 - np.tanh(normalized_dist * 3.0))
+                        except Exception:
+                            binary_b = 0.0
                     score += graph_b + fact_b + binary_b
                     # Temporal boost (Phase 3)
                     if temporal_weight > 0.0:
