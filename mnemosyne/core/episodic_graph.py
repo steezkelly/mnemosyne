@@ -383,9 +383,49 @@ class EpisodicGraph:
             edge.timestamp
         ))
         self.conn.commit()
-    
+
+    def add_temporal_relation(self, source_id: str, target_id: str, relation_type: str, timestamp: str, weight: float = 1.0):
+        """
+        Add a temporal relation (e.g., BEFORE, AFTER) between two memory IDs.
+        If A BEFORE B, then A is the source and B is the target.
+        The relation_type should be 'BEFORE' or 'AFTER'.
+        """
+        if relation_type not in ['BEFORE', 'AFTER']:
+            raise ValueError("relation_type must be 'BEFORE' or 'AFTER'")
+
+        edge = GraphEdge(
+            source=source_id,
+            target=target_id,
+            edge_type=relation_type,
+            weight=weight,
+            timestamp=timestamp
+        )
+        self.add_edge(edge)
+
     # --- Graph Traversal ---
     
+    def query_temporal_relations(self, memory_id: str, relation_type: str) -> List[str]:
+        """
+        Query for memory IDs related temporally to a given memory ID.
+        If relation_type is 'BEFORE', returns memories that happened before memory_id.
+        If relation_type is 'AFTER', returns memories that happened after memory_id.
+        """
+        if relation_type not in ['BEFORE', 'AFTER']:
+            raise ValueError("relation_type must be 'BEFORE' or 'AFTER'")
+
+        cursor = self.conn.cursor()
+        if relation_type == 'BEFORE':
+            cursor.execute(
+                "SELECT source FROM graph_edges WHERE target = ? AND edge_type = ?",
+                (memory_id, "BEFORE")
+            )
+        else:  # 'AFTER'
+            cursor.execute(
+                "SELECT target FROM graph_edges WHERE source = ? AND edge_type = ?",
+                (memory_id, "AFTER")
+            )
+        return [row[0] for row in cursor.fetchall()]
+
     def find_related_memories(self, memory_id: str, depth: int = 2) -> List[str]:
         """
         Find memories related to a given memory via graph traversal.
