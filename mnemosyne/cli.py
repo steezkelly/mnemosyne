@@ -196,7 +196,8 @@ def cmd_export(args):
         f"{result.get('working_memory_count', 0)} working, "
         f"{result.get('episodic_memory_count', 0)} episodic, "
         f"{result.get('legacy_memories_count', 0)} legacy, "
-        f"{result.get('triples_count', 0)} triples "
+        f"{result.get('triples_count', 0)} triples, "
+        f"{result.get('annotations_count', 0)} annotations "
         f"to {output_path}"
     )
 
@@ -220,7 +221,8 @@ def cmd_import(args):
         f"{beam_stats.get('working_memory', {}).get('inserted', 0)} working, "
         f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
         f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
-        f"{result.get('triples', {}).get('inserted', 0)} triples "
+        f"{result.get('triples', {}).get('inserted', 0)} triples, "
+        f"{result.get('annotations', {}).get('inserted', 0)} annotations "
         f"from {args[0]}"
     )
 

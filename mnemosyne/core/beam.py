@@ -19,6 +19,7 @@ import logging
 import sqlite3
 import json
 import hashlib
+import logging
 import threading
 import math
 
@@ -683,26 +684,32 @@ def _vec_available(conn: sqlite3.Connection) -> bool:
 
 def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str):
     """
-    Extract entities from content and store as triples.
+    Extract entities from content and store as annotations (post-E6).
     Called internally by remember() when extract_entities=True.
+
+    Pre-E6 wrote to TripleStore with predicate="mentions", which silently
+    invalidated prior mentions on the same memory via auto-invalidation
+    on (subject, predicate). Post-E6, writes go to AnnotationStore where
+    multiple mentions per memory coexist.
     """
     try:
         from mnemosyne.core.entities import extract_entities_regex
-        from mnemosyne.core.triples import TripleStore
-        
+
         entities = extract_entities_regex(content)
         if not entities:
             return
-        
-        triples = TripleStore(db_path=beam.db_path)
-        for entity in entities:
-            triples.add(
-                subject=memory_id,
-                predicate="mentions",
-                object=entity,
-                source="regex",
-                confidence=0.8
-            )
+
+        # Reuse BeamMemory's shared AnnotationStore (cached on the beam
+        # instance, shares the thread-local connection). UNIQUE constraint
+        # on (memory_id, kind, value) plus INSERT OR IGNORE makes this
+        # idempotent — re-extraction on duplicate-content writes is a no-op.
+        beam.annotations.add_many(
+            memory_id=memory_id,
+            kind="mentions",
+            values=entities,
+            source="regex",
+            confidence=0.8,
+        )
     except Exception:
         # Entity extraction is best-effort; never fail remember() because of it
         pass
@@ -710,26 +717,39 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
 
 def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
     """
-    Extract structured facts from content using LLM and store as triples + facts table.
-    Called internally by remember() when extract=True.
+    Extract structured facts from content using LLM and store as annotations
+    + facts table. Called internally by remember() when extract=True.
 
     Stores in TWO places:
-    1. TripleStore (entity-level triples, backward compat)
+    1. AnnotationStore with kind="fact" (post-E6; was TripleStore pre-E6)
     2. facts table (structured SPO facts for fact_recall())
+
+    Post-E6 note: writes formerly used TripleStore.add_facts() which
+    silently invalidated each prior fact via (subject, predicate) auto-
+    invalidation. AnnotationStore.add_many is append-only so all facts
+    coexist.
     """
     try:
         from mnemosyne.core.extraction import extract_facts_safe
-        from mnemosyne.core.triples import TripleStore
-        
+        from mnemosyne.core.annotations import filter_facts
+
         facts = extract_facts_safe(content)
         if not facts:
             return
-        
-        # Store in triples (existing behavior)
-        triples = TripleStore(db_path=beam.db_path)
-        triples.add_facts(memory_id, facts, source=source, confidence=0.7)
 
-        # ALSO store in facts table (new cloud extraction path)
+        # Filter to match the legacy filtering applied by TripleStore.add_facts.
+        kept = filter_facts(facts)
+        if kept:
+            beam.annotations.add_many(
+                memory_id=memory_id,
+                kind="fact",
+                values=kept,
+                source=source,
+                confidence=0.7,
+            )
+
+        # ALSO store in facts table (new cloud extraction path) — uses the
+        # full facts list (matching pre-E6 behavior).
         _store_facts_in_table(beam, memory_id, content, source, facts)
 
     except Exception:
@@ -777,28 +797,30 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
     """
     Find memory IDs that mention an entity (or similar entity via fuzzy match).
     Returns list of memory_id strings.
+
+    Post-E6: reads from AnnotationStore. Memories with multiple mentions
+    now all surface (silent-destruction bug fixed) — the pre-E6 path
+    against TripleStore returned only the last-written mention per memory
+    because of auto-invalidation on (subject, predicate).
     """
     try:
         from mnemosyne.core.entities import find_similar_entities
-        from mnemosyne.core.triples import TripleStore
-        
-        triples = TripleStore(db_path=beam.db_path)
-        
-        # Get all known entities
-        known_entities = triples.get_distinct_objects("mentions")
+
+        # Get all known entities (uses BeamMemory's cached AnnotationStore)
+        known_entities = beam.annotations.get_distinct_values("mentions")
         if not known_entities:
             return []
-        
+
         # Find similar entities
         matches = find_similar_entities(entity_name, known_entities, threshold=threshold)
-        
+
         # Collect memory IDs for all matched entities
         memory_ids: Set[str] = set()
         for matched_entity, _ in matches:
-            results = triples.query_by_predicate("mentions", object=matched_entity)
+            results = beam.annotations.query_by_kind("mentions", value=matched_entity)
             for row in results:
-                memory_ids.add(row["subject"])
-        
+                memory_ids.add(row["memory_id"])
+
         return list(memory_ids)
     except Exception:
         return []
@@ -807,33 +829,32 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
 def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
     """
     Find memory IDs that have extracted facts matching the query.
-    Does simple keyword matching against stored fact triples.
+    Does simple keyword matching against stored fact annotations.
     Returns list of memory_id strings.
+
+    Post-E6: reads from AnnotationStore. Memories with multiple extracted
+    facts now all surface (silent-destruction bug fixed).
     """
     try:
-        from mnemosyne.core.triples import TripleStore
-        
-        triples = TripleStore(db_path=beam.db_path)
-        
-        # Get all fact triples
-        all_facts = triples.query_by_predicate("fact")
+        # Get all fact annotations (uses BeamMemory's cached AnnotationStore)
+        all_facts = beam.annotations.query_by_kind("fact")
         if not all_facts:
             return []
-        
+
         query_lower = query.lower()
         query_words = set(query_lower.split())
-        
+
         # Simple keyword matching against fact text
         memory_ids: Set[str] = set()
         for fact_row in all_facts:
-            fact_text = fact_row.get("object", "").lower()
+            fact_text = fact_row.get("value", "").lower()
             # Check if any query word appears in the fact
             if any(word in fact_text for word in query_words):
-                memory_ids.add(fact_row["subject"])
+                memory_ids.add(fact_row["memory_id"])
             # Also check if the full query is a substring of the fact
             elif query_lower in fact_text:
-                memory_ids.add(fact_row["subject"])
-        
+                memory_ids.add(fact_row["memory_id"])
+
         return list(memory_ids)
     except Exception:
         return []
@@ -1086,6 +1107,30 @@ class BeamMemory:
         self.conn = _get_connection(self.db_path)
         init_beam(self.db_path)
 
+        # E6: ensure schema split + auto-migrate legacy TripleStore rows
+        # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
+        # who want explicit control. See:
+        # - mnemosyne/migrations/e6_triplestore_split.py
+        # - .hermes/ledger/memory-contract.md (E6)
+        # Also ensure the legacy `triples` table exists — the post-E6
+        # production path no longer writes to it, but external scripts
+        # (scripts/backfill_temporal_triples.py) and deprecation-period
+        # callers of TripleStore still expect the table to be present.
+        try:
+            from mnemosyne.core.triples import init_triples
+            init_triples(db_path=self.db_path)
+        except Exception:
+            pass
+        self._ensure_e6_schema_with_migration()
+
+        # E6: shared AnnotationStore handle reusing this BeamMemory's
+        # thread-local connection. Production call sites use `self.annotations`
+        # instead of constructing fresh AnnotationStore(...) per call —
+        # eliminates the per-call file-descriptor cost the post-E6 review
+        # surfaced (every extraction/recall opened 2 connections + ran DDL).
+        from mnemosyne.core.annotations import AnnotationStore
+        self.annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
+
         # Phase 3: Episodic graph (shared connection)
         self.episodic_graph = None
         if EpisodicGraph is not None:
@@ -1101,6 +1146,119 @@ class BeamMemory:
                 self.veracity_consolidator = VeracityConsolidator(conn=self.conn, db_path=self.db_path)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # E6 schema split + auto-migration
+    # ------------------------------------------------------------------
+    def _ensure_e6_schema_with_migration(self) -> None:
+        """Ensure the AnnotationStore schema exists; auto-migrate legacy
+        TripleStore rows on first run with a pre-E6 database.
+
+        Idempotent. Safe to call on fresh installs (no triples table to
+        migrate) and on databases that have already been migrated.
+
+        Respects ``MNEMOSYNE_AUTO_MIGRATE=0`` for operators who want
+        explicit control over schema migrations. When auto-migration is
+        disabled and a migration would have been required, log a clear
+        warning pointing at the manual migration script — the AnnotationStore
+        schema is still created so downstream code can run, but legacy rows
+        remain in the triples table until the operator runs the script.
+
+        Failures are caught and logged; init does not raise. The provider
+        layer's silent-fail pattern (C27) would mask any exception we
+        raised here, so logging is the visible channel for now. The user-
+        facing pattern is "migration ran (or didn't), continue with
+        whatever schema state we have."
+        """
+        import os
+        from mnemosyne.core.annotations import ANNOTATION_KINDS, init_annotations
+
+        logger = logging.getLogger(__name__)
+
+        # Always ensure the annotations table exists (cheap, idempotent).
+        try:
+            init_annotations(self.db_path)
+        except Exception as e:
+            logger.error("E6: failed to initialize annotations schema: %s", e)
+            return
+
+        # Honor opt-out for operators who want explicit migrations only.
+        if os.environ.get("MNEMOSYNE_AUTO_MIGRATE", "1") == "0":
+            # If a migration would be needed, leave a warning so operators
+            # see something concrete in their logs.
+            try:
+                cursor = self.conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'"
+                )
+                if cursor.fetchone() is not None:
+                    placeholders = ",".join("?" * len(ANNOTATION_KINDS))
+                    cursor = self.conn.execute(
+                        f"SELECT COUNT(*) FROM triples WHERE predicate IN ({placeholders})",
+                        tuple(ANNOTATION_KINDS),
+                    )
+                    pending = cursor.fetchone()[0]
+                    if pending > 0:
+                        logger.warning(
+                            "E6: MNEMOSYNE_AUTO_MIGRATE=0 and %d annotation "
+                            "rows remain in the legacy triples table. Run "
+                            "`python scripts/migrate_triplestore_split.py "
+                            "--db %s` to migrate manually.",
+                            pending,
+                            self.db_path,
+                        )
+            except Exception as e:
+                logger.debug("E6: opt-out probe failed: %s", e)
+            return
+
+        # Auto-migrate path. The migration logic lives inside the package
+        # (mnemosyne.migrations.e6_triplestore_split) so pip-installed
+        # deployments get the same auto-migrate behavior as source checkouts.
+        # No filesystem-relative path resolution; just import.
+        try:
+            from mnemosyne.migrations.e6_triplestore_split import (
+                migrate as _e6_migrate,
+                has_pending_migration as _e6_has_pending,
+            )
+
+            # Fast-path: cheap index-driven existence check before any
+            # heavyweight classify scan / Python-side set diff. Most BeamMemory
+            # inits on a post-migration DB end here in microseconds.
+            if not _e6_has_pending(self.conn):
+                return
+
+            # Flush any pending writes on our connection (init_beam commits
+            # internally, but be defensive). The migration opens its own
+            # connection; under WAL mode multiple connections to the same
+            # SQLite file coexist without us closing ours.
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+
+            written = _e6_migrate(
+                db_path=self.db_path,
+                dry_run=False,
+                backup=True,
+                log_fn=lambda line: logger.info("E6 migrate: %s", line),
+            )
+            if written > 0:
+                logger.warning(
+                    "E6: auto-migrated %d annotation rows from triples → "
+                    "annotations. Backup is at %s.pre_e6_backup "
+                    "(from this run if newly created, or an earlier run if "
+                    "the file already existed). "
+                    "Set MNEMOSYNE_AUTO_MIGRATE=0 to disable auto-migration.",
+                    written,
+                    self.db_path,
+                )
+        except Exception as e:
+            logger.error(
+                "E6: auto-migration failed (continuing init with current schema "
+                "state). Run `python scripts/migrate_triplestore_split.py "
+                "--db %s` manually. Error: %s",
+                self.db_path,
+                e,
+            )
 
     # ------------------------------------------------------------------
     # Working Memory
@@ -1431,30 +1589,31 @@ class BeamMemory:
                 pass  # Veracity failures are non-blocking
 
     def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
-        """Auto-generate temporal triple for a memory. Bridges BEAM and TripleStore."""
+        """Auto-generate temporal annotations for a memory.
+
+        Post-E6: writes occurred_on / has_source as annotations rather
+        than triples. These are inherently single-valued per memory
+        today, but `annotations` is the correct home — they describe a
+        memory rather than expressing a current-truth fact like
+        "user prefers X". Method name kept for backward compat.
+        """
         try:
-            # Import triples module lazily to avoid circular dependency
-            from mnemosyne.core.triples import TripleStore, init_triples
             date_str = timestamp[:10]  # YYYY-MM-DD
-            # Ensure triples table exists
-            init_triples(db_path=self.db_path)
-            triple_store = TripleStore(db_path=self.db_path)
-            triple_store.add(
-                subject=memory_id,
-                predicate="occurred_on",
-                object=date_str,
-                valid_from=date_str
+            # Reuse the cached AnnotationStore handle on self.
+            self.annotations.add(
+                memory_id=memory_id,
+                kind="occurred_on",
+                value=date_str,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
-                triple_store.add(
-                    subject=memory_id,
-                    predicate="has_source",
-                    object=source,
-                    valid_from=date_str
+                self.annotations.add(
+                    memory_id=memory_id,
+                    kind="has_source",
+                    value=source,
                 )
         except Exception:
-            # TripleStore is optional; don't fail memory write if triples fail
+            # Annotation writes are optional; don't fail memory write if they fail
             pass
 
     def _trim_working_memory(self):

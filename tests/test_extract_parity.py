@@ -85,9 +85,13 @@ class TestWrapperExtractFactsTableParity:
             "wrapper path should populate it like BeamMemory does"
         )
 
-    def test_wrapper_extract_still_writes_triples_table(self, tmp_path, fake_extract_facts):
-        """Regression guard: the facts-table fix must NOT remove the
-        existing triples write."""
+    def test_wrapper_extract_writes_annotations_table(self, tmp_path, fake_extract_facts):
+        """Regression guard: the facts-table fix must produce a populated
+        annotation store. Post-E6 (PR #70), extraction routes to the new
+        AnnotationStore instead of the legacy `triples` table — the C12.a
+        contract is preserved by verifying `kind='fact'` annotations exist.
+        """
+        from mnemosyne.core.annotations import AnnotationStore
         db_path = tmp_path / "c12a.db"
         mem = Mnemosyne(session_id="c12a", db_path=db_path)
         mem.remember(
@@ -95,9 +99,11 @@ class TestWrapperExtractFactsTableParity:
             source="user",
             extract=True,
         )
-        assert _triples_table_count(db_path) >= 1, (
-            "triples table empty after extract=True; the wrapper's existing "
-            "behavior must not regress"
+        ann_store = AnnotationStore(db_path=db_path)
+        fact_rows = ann_store.query_by_kind("fact")
+        assert len(fact_rows) >= 1, (
+            "annotations table empty for kind='fact' after extract=True; "
+            "the wrapper's extraction behavior must not regress"
         )
 
     def test_wrapper_extracted_fact_is_visible_via_fact_recall(self, tmp_path, fake_extract_facts):
@@ -184,7 +190,10 @@ class TestWrapperExtractEntitiesParity:
     this to BeamMemory's _extract_and_store_entities helper; this test
     locks in equivalent observable behavior."""
 
-    def test_wrapper_extract_entities_writes_mention_triples(self, tmp_path):
+    def test_wrapper_extract_entities_writes_mention_annotations(self, tmp_path):
+        """Post-E6: mentions land in the annotations table, not triples.
+        Method renamed to match the new storage target."""
+        from mnemosyne.core.annotations import AnnotationStore
         db_path = tmp_path / "c12a.db"
         mem = Mnemosyne(session_id="c12a", db_path=db_path)
         # A content string that the regex extractor will pick entities from.
@@ -196,16 +205,9 @@ class TestWrapperExtractEntitiesParity:
             source="user",
             extract_entities=True,
         )
-        # At least one triple with predicate='mentions' should exist.
-        import sqlite3
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cur = conn.execute(
-                "SELECT COUNT(*) FROM triples WHERE predicate = 'mentions'"
-            )
-            count = cur.fetchone()[0]
-        finally:
-            conn.close()
-        assert count >= 1, (
-            "extract_entities=True did not produce 'mentions' triples"
+        # At least one annotation with kind='mentions' should exist.
+        ann_store = AnnotationStore(db_path=db_path)
+        rows = ann_store.query_by_kind("mentions")
+        assert len(rows) >= 1, (
+            "extract_entities=True did not produce 'mentions' annotations"
         )

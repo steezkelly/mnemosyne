@@ -93,13 +93,17 @@ def test_export_reports_actual_exported_memory_counts(tmp_path):
     result = run_cli(["export", str(export_path)], tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert "Exported 1 working, 0 episodic, 1 legacy, 2 triples" in result.stdout
+    # Post-E6: occurred_on / has_source annotations land in the annotations
+    # table, not in triples. Export message surfaces both counts so operators
+    # see the split clearly.
+    assert "Exported 1 working, 0 episodic, 1 legacy, 0 triples, 2 annotations" in result.stdout
     assert "Exported 0 memories" not in result.stdout
 
     exported = json.loads(export_path.read_text(encoding="utf-8"))
     assert len(exported["working_memory"]) == 1
     assert len(exported["legacy_memories"]) == 1
-    assert len(exported["triples"]) == 2
+    assert len(exported["triples"]) == 0
+    assert len(exported["annotations"]) == 2
 
 
 def test_import_reports_actual_imported_memory_counts(tmp_path):
@@ -116,7 +120,9 @@ def test_import_reports_actual_imported_memory_counts(tmp_path):
     result = run_cli(["import", str(export_path)], import_dir)
 
     assert result.returncode == 0, result.stderr
-    assert "Imported 1 working, 0 episodic, 1 legacy, 2 triples" in result.stdout
+    # Post-E6: annotations imported alongside triples (the temporal anchor
+    # rows moved to the annotations table).
+    assert "Imported 1 working, 0 episodic, 1 legacy, 0 triples, 2 annotations" in result.stdout
     assert "Imported 0 memories" not in result.stdout
 
 
