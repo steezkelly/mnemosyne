@@ -496,14 +496,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
 
-    # Canonical veracity allowlist mirrors VERACITY_WEIGHTS in
-    # mnemosyne/core/veracity_consolidation.py. Anything outside this set
-    # bypasses the recall weighting AND pollutes the contamination filter
-    # (which compares `veracity != 'stated'`), so unknown labels persist as
-    # garbage in the row. Clamp at the trust boundary.
-    _VERACITY_ALLOWED = {"stated", "inferred", "tool", "imported", "unknown"}
-
     def _handle_remember(self, args: Dict[str, Any]) -> str:
+        # Import at call-site so the provider module loads even when
+        # the optional veracity_consolidation chain isn't on path
+        # (BeamMemory ships a fallback). At call-time the import is
+        # always satisfied because BeamMemory is already constructed.
+        from mnemosyne.core.veracity_consolidation import clamp_veracity
+
         content = args.get("content", "")
         importance = float(args.get("importance", 0.5))
         source = args.get("source", "user")
@@ -512,16 +511,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         extract_entities = bool(args.get("extract_entities", False))
         extract = bool(args.get("extract", False))
         metadata = args.get("metadata") or None
-        raw_veracity = args.get("veracity", "unknown") or "unknown"
-        veracity_norm = str(raw_veracity).strip().lower()
-        if veracity_norm in self._VERACITY_ALLOWED:
-            veracity = veracity_norm
-        else:
-            logger.warning(
-                "mnemosyne_remember received unknown veracity %r; clamping to 'unknown'",
-                raw_veracity,
-            )
-            veracity = "unknown"
+        # Trust-boundary clamp — see VERACITY_ALLOWED in
+        # mnemosyne/core/veracity_consolidation.py for the canonical set.
+        veracity = clamp_veracity(
+            args.get("veracity"), context="mnemosyne_remember"
+        )
         if not content:
             return json.dumps({"error": "content is required"})
         memory_id = self._beam.remember(

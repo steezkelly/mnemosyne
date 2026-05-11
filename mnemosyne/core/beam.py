@@ -27,6 +27,9 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
 
+
+logger = logging.getLogger(__name__)
+
 # Typed memory classification (Phase 1 — zero overhead, pattern-based)
 try:
     from mnemosyne.core.typed_memory import classify_memory, MemoryType
@@ -54,10 +57,45 @@ except ImportError:
     EpisodicGraph = None
     GraphEdge = None
 try:
-    from mnemosyne.core.veracity_consolidation import VeracityConsolidator, VERACITY_WEIGHTS
+    from mnemosyne.core.veracity_consolidation import (
+        VeracityConsolidator,
+        VERACITY_WEIGHTS,
+        clamp_veracity,
+    )
 except ImportError:
     VeracityConsolidator = None
     VERACITY_WEIGHTS = {}
+
+    # Surface degraded mode at import time so operators see ONE signal
+    # in startup logs that the canonical helper isn't available. Without
+    # this, the fallback silently clamps every bad label with no audit
+    # trail across the run.
+    logger.warning(
+        "mnemosyne.core.veracity_consolidation unavailable; using fallback "
+        "clamp_veracity. Non-canonical veracity labels will be clamped "
+        "silently (no per-call WARNING). Operators should resolve the "
+        "import to restore full audit logging."
+    )
+
+    def clamp_veracity(raw, *, context: str = "veracity") -> str:
+        """Fallback when veracity_consolidation is unavailable.
+        Mirrors the canonical helper's API and clamps non-canonical
+        labels to 'unknown'. Does NOT log per-call warnings — the
+        import-time warning above is the audit signal. Operators
+        should fix the import to restore full observability.
+        """
+        if raw is None:
+            return "unknown"
+        norm = str(raw).strip().lower()
+        if not norm:
+            return "unknown"
+        # Without the canonical allowlist available, fall back to the
+        # known-safe set inline. Drift between this literal and the
+        # canonical set is bounded by the fact that this branch
+        # only fires when the import is broken.
+        if norm in {"stated", "inferred", "tool", "imported", "unknown"}:
+            return norm
+        return "unknown"
 
 try:
     import numpy as np
@@ -1072,8 +1110,18 @@ class BeamMemory:
             extract_entities: If True, extract and store entity mentions as triples
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
-            veracity: Confidence level — 'stated', 'inferred', 'tool', 'imported', 'unknown'
+            veracity: Confidence level — 'stated', 'inferred', 'tool', 'imported', 'unknown'.
+                Non-canonical labels are clamped to 'unknown' with a WARNING
+                (mirrors the C12.b clamp at the hermes_memory_provider boundary).
         """
+        # Clamp veracity at the BeamMemory.remember entry too — the
+        # method is the lowest-level public ingest path under BeamMemory,
+        # so consistency with remember_batch and the provider
+        # boundary requires clamping here. Pre-E4 the column was raw;
+        # the new recall multiplier means non-canonical labels would
+        # silently fall through to UNKNOWN_WEIGHT at scoring time.
+        veracity = clamp_veracity(veracity, context="remember")
+
         # --- Typed memory classification (Phase 1 — zero overhead) ---
         memory_type = None
         if classify_memory is not None:
@@ -1151,14 +1199,59 @@ class BeamMemory:
                          source=source, importance=importance, metadata=metadata)
         return memory_id
 
-    def remember_batch(self, items: List[Dict]) -> List[str]:
+    def remember_batch(self, items: List[Dict],
+                       *,
+                       veracity: Optional[str] = None,
+                       force_veracity: bool = False) -> List[str]:
         """
         Batch insert into working_memory for high-throughput ingestion.
-        Each item dict should have keys: content, source, importance, metadata (optional).
+        Each item dict should have keys: content, source, importance,
+        metadata (optional), veracity (optional).
+
+        Legal veracity values: 'stated', 'inferred', 'tool', 'imported',
+        'unknown'. None / empty / whitespace silently → 'unknown'.
+        Non-canonical non-empty labels emit a WARNING and clamp to
+        'unknown'.
+
+        veracity (method-level kwarg): default applied to items that
+            don't supply their own `veracity` key.
+
+        force_veracity (default False): security knob. When True, the
+            method-level `veracity` is applied to EVERY row uniformly
+            and per-item `item["veracity"]` is IGNORED (warning logged
+            per item if present so the operator sees the override).
+            Use this when the caller is the authority on trust —
+            e.g., an importer ingesting LLM-generated content that
+            shouldn't be able to self-elevate its label. Pre-E4 the
+            per-item override was harmless because veracity didn't
+            affect ranking; post-E4 it gates a real ranking signal
+            so callers consuming untrusted content need this knob.
+            When False (default), per-item `veracity` keys override
+            the method default — preserves the legitimate use case
+            of mixed-trust batches (e.g., user messages='stated',
+            tool observations='tool').
+
+        All values are clamped to the canonical allowlist via
+        `clamp_veracity` (mirrors C12.b at the hermes_memory_provider
+        trust boundary). remember_batch is the high-throughput path
+        used by importers, the BEAM benchmark adapter, and batch
+        ingest CLIs where label quality varies.
+
+        Pre-E4 the column defaulted to 'unknown' for every batch row;
+        recall's veracity multiplier collapsed to a constant 0.8
+        (global scale factor instead of rank signal). The recall
+        scorer at beam.py::recall now applies the multiplier to
+        working_memory hits too, so per-row veracity differentiates
+        scores at the experiment level.
         """
         cursor = self.conn.cursor()
         ids = []
         timestamp = datetime.now().isoformat()
+        # Clamp the method-level default once, not per row — operators
+        # who pass a bad default should see one warning, not N.
+        default_veracity = clamp_veracity(
+            veracity, context="remember_batch.default"
+        )
         for item in items:
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
@@ -1170,10 +1263,31 @@ class BeamMemory:
                     item_type = result.memory_type.value
                 except Exception:
                     pass
+            # Per-item override semantics gated by force_veracity. In
+            # strict mode (force_veracity=True) per-item keys are
+            # ignored — the caller is the trust authority. Otherwise
+            # per-item overrides the method-level default. Either way
+            # the final value passes through clamp_veracity at the
+            # trust boundary.
+            if force_veracity:
+                if "veracity" in item:
+                    logger.warning(
+                        "remember_batch.force_veracity=True; "
+                        "ignoring per-item veracity %r in favor of "
+                        "method-level default %r",
+                        item["veracity"], default_veracity,
+                    )
+                item_veracity = default_veracity
+            elif "veracity" in item:
+                item_veracity = clamp_veracity(
+                    item["veracity"], context="remember_batch.per_item"
+                )
+            else:
+                item_veracity = default_veracity
             cursor.execute("""
                 INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
-                author_id, author_type, channel_id, memory_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                author_id, author_type, channel_id, memory_type, veracity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 memory_id,
                 item["content"],
@@ -1185,7 +1299,8 @@ class BeamMemory:
                 item.get("author_id", self.author_id),
                 item.get("author_type", self.author_type),
                 item.get("channel_id", self.channel_id),
-                item_type
+                item_type,
+                item_veracity,
             ))
         self.conn.commit()
         
@@ -2332,6 +2447,18 @@ class BeamMemory:
                     r["score"] *= weight_map.get(ep_tier, 1.0)
                     r["score"] *= veracity_map.get(ep_veracity, UNKNOWN_WEIGHT)
 
+        # [E4] Apply the veracity multiplier to working_memory results
+        # too. Pre-E4 the multiplier was episodic-only, so per-row
+        # veracity on working_memory rows (now populated by
+        # remember_batch with per-row labels) had no scoring effect —
+        # batch-ingested 'stated' content didn't rank above 'unknown'.
+        # The row dicts already carry "veracity" from the SELECT
+        # populated earlier in this function, so no second query needed.
+        for r in results:
+            if r.get("tier") == "working":
+                wm_veracity = r.get("veracity") or "unknown"
+                r["score"] *= veracity_map.get(wm_veracity, UNKNOWN_WEIGHT)
+
         results.sort(key=lambda x: x["score"], reverse=True)
         final_results = results[:top_k]
 
@@ -3406,11 +3533,19 @@ class BeamMemory:
             }
         }
 
-        # Working memory (all sessions)
+        # Working memory (all sessions). veracity is now part of the
+        # row's recall-scoring identity (post-E4 — the multiplier
+        # applies to working_memory hits), so it must survive
+        # backup/restore. Without it, restored rows collapse to
+        # 'unknown' and lose their per-row trust signal.
+        # NOTE: the recall multiplier at beam.py::recall (the
+        # `if r.get("tier") == "working":` block) depends on this
+        # column being in the row dict; do not drop it from this
+        # SELECT without updating the multiplier path.
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id, importance,
                    metadata_json, valid_until, superseded_by, scope,
-                   recall_count, last_recalled, created_at
+                   recall_count, last_recalled, created_at, veracity
             FROM working_memory
             ORDER BY session_id, timestamp
         """)
@@ -3493,17 +3628,24 @@ class BeamMemory:
                 stats["working_memory"]["overwritten"] += 1
             else:
                 stats["working_memory"]["inserted"] += 1
+            # veracity preserves the per-row trust signal across
+            # backup/restore. Pre-E4 1.0 exports (no key in dict) get
+            # NULL, which the recall multiplier handles via the
+            # 'unknown' fallback. The clamp at write time means new
+            # rows always carry a canonical label.
             cursor.execute("""
                 INSERT INTO working_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
-                 valid_until, superseded_by, scope, recall_count, last_recalled, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
+                 veracity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), item.get("timestamp"),
                 item.get("session_id", "default"), item.get("importance", 0.5),
                 item.get("metadata_json", "{}"), item.get("valid_until"),
                 item.get("superseded_by"), item.get("scope", "session"),
-                item.get("recall_count", 0), item.get("last_recalled"), item.get("created_at")
+                item.get("recall_count", 0), item.get("last_recalled"), item.get("created_at"),
+                item.get("veracity"),
             ))
         self.conn.commit()
 

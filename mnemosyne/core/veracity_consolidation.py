@@ -22,12 +22,16 @@ Conflict resolution:
 - Consolidation: periodic synthesis of high-confidence facts
 """
 
+import logging
 import sqlite3
 import json
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 # Veracity weights
@@ -38,6 +42,58 @@ VERACITY_WEIGHTS = {
     "imported": 0.6,
     "unknown": 0.8,
 }
+
+# Canonical allowlist for trust-boundary clamping. Anything outside this
+# set bypasses the recall weighting (VERACITY_WEIGHTS.get(..., 0.8) falls
+# back to the 'unknown' weight) AND pollutes the contamination filter
+# downstream (which compares `veracity != 'stated'`). Callers at the
+# trust boundary (LLM output, importers, MCP tool args, batch ingest)
+# should clamp via clamp_veracity() so non-canonical labels don't
+# persist as garbage in the row.
+VERACITY_ALLOWED = frozenset(VERACITY_WEIGHTS.keys())
+
+
+# Cap on the raw value included in the WARNING log. Without this, an
+# importer pushing 100k items with embedded long strings as veracity
+# values can flood log aggregators (cost) AND leak user content into
+# operator logs (privacy). 80 chars is enough to debug typos / case
+# issues without being a privacy or storage hazard.
+_VERACITY_WARN_VALUE_CAP = 80
+
+
+def clamp_veracity(raw, *, context: str = "veracity") -> str:
+    """Normalize and clamp a veracity label to the canonical allowlist.
+
+    Behavior:
+        - None / empty / whitespace → 'unknown' silently
+        - Case-and-whitespace normalize then match against VERACITY_ALLOWED
+        - Anything else → 'unknown' with a WARNING log (raw value
+          truncated to %d chars to bound log volume)
+
+    `context` appears in the warning so the operator can see where
+    the bad label came from (e.g. 'remember_batch.default',
+    'remember_batch.per_item', 'mnemosyne_remember').
+    """ % _VERACITY_WARN_VALUE_CAP
+    if raw is None:
+        return "unknown"
+    norm = str(raw).strip().lower()
+    if not norm:
+        return "unknown"
+    if norm in VERACITY_ALLOWED:
+        return norm
+    # Truncate the raw value for the log line. %r quoting prevents
+    # control-character injection into log aggregators; the cap
+    # prevents log-flood and content leakage from upstream typos.
+    raw_str = str(raw)
+    if len(raw_str) > _VERACITY_WARN_VALUE_CAP:
+        raw_for_log = raw_str[:_VERACITY_WARN_VALUE_CAP] + "...[truncated]"
+    else:
+        raw_for_log = raw_str
+    logger.warning(
+        "%s received unknown veracity %r; clamping to 'unknown'",
+        context, raw_for_log,
+    )
+    return "unknown"
 
 
 @dataclass
