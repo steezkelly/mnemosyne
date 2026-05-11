@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [Unreleased]
+
+### Added
+
+**E5 — PolyphonicRecallEngine wired under feature flag**
+- `MNEMOSYNE_POLYPHONIC_RECALL=1` activates the engine inside `BeamMemory.recall()`. Default (unset or `0`): existing linear scorer runs unchanged. Production behavior preserved.
+- When the flag is ON, recall runs 4 voices in parallel via `PolyphonicRecallEngine`:
+  - **vector** — binary-vector similarity through `BinaryVectorStore`
+  - **graph** — entity-driven traversal through `EpisodicGraph`
+  - **fact** — consolidated-fact matching through `VeracityConsolidator`
+  - **temporal** — recency decay (only fires when the query carries a temporal keyword)
+  - Voices are fused via Reciprocal Rank Fusion (RRF, k=60), diversity-reranked, and assembled within a context budget.
+- Each result dict gains a `voice_scores` field carrying per-voice provenance — operators can see WHICH voices contributed to a given ranking.
+- The inline `graph_bonus` / `fact_bonus` terms in the linear scorer (added by commit `9f96ded`) are bypassed when the engine path runs; the engine handles those signals natively via RRF rather than as additive bonuses.
+- Flag is read per `recall()` call, not at `__init__` time — operators can toggle the engine without rebuilding `BeamMemory` (critical for in-process A/B experiments).
+
+### Changed
+
+**E5 — Engine reuses BeamMemory's shared connection**
+- `PolyphonicRecallEngine.__init__(db_path, conn=None)` now accepts an optional shared SQLite connection. When `conn` is passed, the engine and its subsystems (`BinaryVectorStore`, `EpisodicGraph`, `VeracityConsolidator`, `_temporal_voice`) reuse it instead of spawning new connections per recall call. Pre-E5 every recall call would open 4+ new connections — wasteful and inconsistent with the post-`9f96ded` pattern for the subsystems.
+- Standalone usage (no shared conn) still works — `_temporal_voice` opens a short-lived connection when `self.conn is None`.
+
+### Notes for callers
+
+- Defaults are unchanged. If you don't set `MNEMOSYNE_POLYPHONIC_RECALL=1`, you get the same recall behavior as before.
+- The engine's RRF combined_score replaces the linear scorer's weighted score in the result `score` field. Score MAGNITUDES will differ between the two paths (RRF produces small positive floats from `1/(60+rank)` summed across voices; the linear scorer produces values in [0, ~1]). Rankings are the comparable signal, not absolute scores.
+- The engine doesn't currently apply the post-E4 veracity multiplier or the tier degradation multiplier. Those are linear-scorer-only modulators. Flag=ON callers wanting that scoring composition should request it as a follow-up (E5.a).
+- Fact-voice synthetic memory ids (`cf_subject_predicate_object`) are dropped from the final list — they don't correspond to actual rows. The fact voice's score signal still flows through RRF onto real memory_ids surfaced by other voices.
+
 ## [2.5] — 2026-05-10
 
 ### Added

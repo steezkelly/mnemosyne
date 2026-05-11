@@ -63,14 +63,30 @@ class PolyphonicRecallEngine:
     - temporal: Time-aware scoring
     """
     
-    def __init__(self, db_path: Path = None):
+    def __init__(self, db_path: Path = None, conn: sqlite3.Connection = None):
+        """Initialize the engine.
+
+        db_path: filesystem path to the SQLite DB. Used by voices that
+            spawn their own connection (only when conn is None).
+        conn: optional shared sqlite3 connection. When provided, the
+            engine and its subsystems (vector_store / graph /
+            consolidator / temporal_voice) reuse this connection
+            instead of spawning their own. Required for safe use under
+            BeamMemory's thread-local connection model — without this,
+            each polyphonic recall call would open 4+ new connections
+            (one per voice + one per subsystem) which both wastes
+            resources and risks WAL-readback inconsistency under
+            concurrent writers.
+        """
         self.db_path = db_path or Path.home() / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db"
-        
-        # Initialize subsystems
-        self.vector_store = BinaryVectorStore(db_path=self.db_path)
-        self.graph = EpisodicGraph(db_path=self.db_path)
-        self.consolidator = VeracityConsolidator(db_path=self.db_path)
-        
+        self.conn = conn  # may be None — voices fall back to per-call open
+
+        # Initialize subsystems. Each accepts an optional conn= since
+        # 9f96ded; pass through so they share our handle.
+        self.vector_store = BinaryVectorStore(db_path=self.db_path, conn=conn)
+        self.graph = EpisodicGraph(db_path=self.db_path, conn=conn)
+        self.consolidator = VeracityConsolidator(db_path=self.db_path, conn=conn)
+
         # Voice weights (deterministic, learned from validation)
         self.voice_weights = {
             "vector": 0.35,
@@ -205,7 +221,7 @@ class PolyphonicRecallEngine:
     def _temporal_voice(self, query: str) -> List[RecallResult]:
         """
         Voice 4: Time-aware scoring.
-        
+
         Boosts recent memories, penalizes old ones.
         Uses exponential decay based on age.
         """
@@ -214,51 +230,60 @@ class PolyphonicRecallEngine:
             "yesterday", "today", "recent", "last", "latest",
             "this week", "this month", "ago", "before"
         ]
-        
+
         has_temporal = any(kw in query.lower() for kw in temporal_keywords)
-        
+
         if not has_temporal:
             return []
-        
-        # Query recent memories from working_memory (if table exists)
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
+
+        # Use the shared connection when available; otherwise open a
+        # short-lived one (path used by the engine's standalone tests
+        # and `python -m polyphonic_recall` self-test).
+        if self.conn is not None:
+            conn = self.conn
+            own_conn = False
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            own_conn = True
         cursor = conn.cursor()
-        
-        # Check if working_memory table exists
-        cursor.execute("""
-            SELECT name FROM sqlite_master WHERE type='table' AND name='working_memory'
-        """)
-        if not cursor.fetchone():
-            conn.close()
-            return []
-        
-        # Get memories from last 7 days
-        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-        cursor.execute("""
-            SELECT id, content, timestamp, importance
-            FROM working_memory
-            WHERE timestamp > ?
-            ORDER BY timestamp DESC
-            LIMIT 20
-        """, (week_ago,))
-        
-        results = []
-        for row in cursor.fetchall():
-            # Calculate temporal score
-            age = datetime.now() - datetime.fromisoformat(row["timestamp"])
-            age_days = age.total_seconds() / 86400
-            temporal_score = np.exp(-age_days / 7)  # 7-day half-life
-            
-            results.append(RecallResult(
-                memory_id=row["id"],
-                score=temporal_score * row["importance"],
-                voice="temporal",
-                metadata={"age_days": age_days, "importance": row["importance"]}
-            ))
-        
-        conn.close()
-        return results
+
+        try:
+            # Check if working_memory table exists
+            cursor.execute("""
+                SELECT name FROM sqlite_master WHERE type='table' AND name='working_memory'
+            """)
+            if not cursor.fetchone():
+                return []
+
+            # Get memories from last 7 days
+            week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            cursor.execute("""
+                SELECT id, content, timestamp, importance
+                FROM working_memory
+                WHERE timestamp > ?
+                ORDER BY timestamp DESC
+                LIMIT 20
+            """, (week_ago,))
+
+            results = []
+            for row in cursor.fetchall():
+                # Calculate temporal score
+                age = datetime.now() - datetime.fromisoformat(row["timestamp"])
+                age_days = age.total_seconds() / 86400
+                temporal_score = np.exp(-age_days / 7)  # 7-day half-life
+
+                results.append(RecallResult(
+                    memory_id=row["id"],
+                    score=temporal_score * row["importance"],
+                    voice="temporal",
+                    metadata={"age_days": age_days, "importance": row["importance"]}
+                ))
+
+            return results
+        finally:
+            if own_conn:
+                conn.close()
     
     def _extract_entities(self, text: str) -> List[str]:
         """Extract potential entity names from text."""
