@@ -1576,14 +1576,20 @@ class BeamMemory:
 
         for row in rows:
             content_lower = row["content"].lower()
+            content_words_list = content_lower.split()
+            content_words_set = set(content_words_list)
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
                 relevance = normalized
             else:
+                # exact: query words appearing in content (substring match, not token equality)
                 exact = sum(1 for w in query_words if w in content_lower)
-                partial = sum(1 for w in query_words for cw in content_lower.split() if w in cw or cw in w)
-                # Cross-substring match: if any query word is a substring of content, or vice versa
-                cross = sum(1 for w in query_words if len(w) >= 2 for cw in content_lower.split() if len(cw) >= 2 and (w in cw or cw in w))
+                # partial: unique query words with substring match in content words (set-based, not cartesian)
+                partial = sum(1 for w in query_words if len(w) >= 2 and any(w in cw or cw in w for cw in content_words_set if len(cw) >= 2))
+                # cross: query substrings matched against content word substrings (set-based)
+                query_substr = {w for w in query_words if len(w) >= 2}
+                content_substr = {cw for cw in content_words_set if len(cw) >= 2}
+                cross = sum(1 for q in query_substr for c in content_substr if q in c or c in q)
                 # Also check if the full query is a substring of content (handles spaceless languages)
                 full_match = 1.0 if query_lower in content_lower else 0.0
                 if not full_match and content_lower in query_lower:
@@ -1999,9 +2005,25 @@ class BeamMemory:
                     fact_bonus = min(match_count * 0.04, 0.1)
                 except Exception:
                     pass
-            # Binary vector voice (Phase 5): disabled — ITS scores cluster too tightly (0.53-0.63)
-            # for discriminative ranking at small top-k. Re-enable once batched ANN index is wired.
-            binary_bonus = 0.0
+            # Binary vector voice (Phase 5): re-enabled — binary vectors are now
+            # backfilled for all episodic entries. ITS discriminability improves at
+            # scale (1033 entries); clustering concern was for small synthetic sets.
+            if query_bv is not None and bv is not None:
+                try:
+                    # Compute hamming distance via XOR + popcount
+                    q_arr = np.frombuffer(query_bv, dtype=np.uint8)
+                    m_arr = np.frombuffer(bv, dtype=np.uint8)
+                    xor_arr = np.bitwise_xor(q_arr, m_arr)
+                    popcount_table = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint32)
+                    h_dist = int(np.sum(popcount_table[xor_arr]))
+                    # Sigmoid: max bonus at distance=0, bonus ~0 at distance=EMBEDDING_DIM
+                    # Use tanh for smooth falloff; bonus range [0, 0.08]
+                    normalized_dist = h_dist / EMBEDDING_DIM  # 0.0 (identical) to 1.0 (opposite)
+                    binary_bonus = 0.08 * (1.0 - np.tanh(normalized_dist * 3.0))
+                except Exception:
+                    binary_bonus = 0.0
+            else:
+                binary_bonus = 0.0
 
             score = base_score * (0.7 + 0.3 * decay)
             score += graph_bonus + fact_bonus + binary_bonus  # Phase 5: polyphonic bonuses
@@ -2043,9 +2065,15 @@ class BeamMemory:
             """, em_params)
             for row in cursor.fetchall():
                 content_lower = row["content"].lower()
-                exact = sum(1 for w in query_words if w in content_lower)
-                partial = sum(1 for w in query_words for cw in content_lower.split() if w in cw or cw in w)
-                cross = sum(1 for w in query_words if len(w) >= 2 for cw in content_lower.split() if len(cw) >= 2 and (w in cw or cw in w))
+                content_words_set = set(content_lower.split())
+                # exact: query words appearing as complete tokens in content
+                exact = sum(1 for w in query_words if w in content_words_set)
+                # partial: unique query words with substring match in content words (set-based, not cartesian)
+                partial = sum(1 for w in query_words if len(w) >= 2 and any(w in cw or cw in w for cw in content_words_set if len(cw) >= 2))
+                # cross: query substrings matched against content word substrings (set-based)
+                query_substr = {w for w in query_words if len(w) >= 2}
+                content_substr = {cw for cw in content_words_set if len(cw) >= 2}
+                cross = sum(1 for q in query_substr for c in content_substr if q in c or c in q)
                 full_match = 1.0 if query_lower in content_lower else 0.0
                 if not full_match and content_lower in query_lower:
                     full_match = 0.5
