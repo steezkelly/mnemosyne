@@ -1610,6 +1610,25 @@ class BeamMemory:
                 kw_share = (1.0 - iw) * 0.6
                 rc_share = (1.0 - iw) * 0.4
                 base_score = relevance * kw_share + row["importance"] * iw
+                # Co-occurrence bonus: for items matched by FTS OR, items that contain MORE
+                # of the query's content words get a rank bonus. This breaks ties in OR
+                # queries where no single term uniquely identifies the answer (Q9, Q18).
+                # Computed from content words (same stop-word filtering as FTS OR query).
+                if wm_ranks and row["id"] in wm_ranks:
+                    _stop_words = {'when','does','do','did','what','how','where','which','who','why',
+                                   'is','are','was','were','can','will','would','should','could','may',
+                                   'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
+                    query_content_words = {w for w in query_words if w not in _stop_words and len(w) > 1}
+                    if query_content_words:
+                        hit_count = sum(1 for cw in query_content_words
+                                        if any(cw in w or w in cw for w in content_words_set if len(w) >= 2))
+                        base_score += hit_count * 0.05
+                # Exact FTS match bonus: if this item had a BM25 rank (was in FTS results),
+                # give it a small boost. This prevents recent non-matches from dominating
+                # when older items had an actual keyword hit.
+                if wm_ranks and row["id"] in wm_ranks:
+                    # BM25 rank already in normalized (0-1). Small additive bonus.
+                    base_score += 0.05
                 # Blend vector similarity into working memory score (weighted toward keyword precision)
                 vec_sim = wm_vec_sims.get(row["id"], 0.0)
                 if vec_sim > 0:
