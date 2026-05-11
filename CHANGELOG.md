@@ -10,19 +10,31 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 ### Changed
 
 **E4 — Veracity threading in `remember_batch` + working-memory recall multiplier**
-- `BeamMemory.remember_batch(items, *, veracity=None)` accepts a method-level `veracity` kwarg as the per-batch default, and each item dict may carry its own `veracity` key as a per-item override. Both are clamped at the trust boundary to the canonical allowlist (`stated`, `inferred`, `tool`, `imported`, `unknown`). Non-canonical labels (case variants, typos, LLM hallucinations) fall back to `unknown` with a WARNING log. Mirrors the C12.b clamp pattern at the `hermes_memory_provider` boundary.
-- `BeamMemory.recall()` applies the veracity multiplier to **working-memory** results too, not just episodic. Pre-E4 the multiplier only fired on episodic rows, so per-row veracity on working_memory rows (now populated by `remember_batch` with per-row labels) had no scoring effect. This unblocks experiment Arms A and C of the BEAM-recovery experiment: without per-row veracity differentiation, the recall scorer cannot rank confident facts above unconfident ones.
+- `BeamMemory.remember_batch(items, *, veracity=None, force_veracity=False)` — new kwargs. `veracity` is the per-batch default; `force_veracity` is a security knob that forces the method default and ignores per-item `item["veracity"]`. Default `force_veracity=False` preserves the legitimate mixed-trust batch use case (user messages = `stated`, tool observations = `tool`). Set `force_veracity=True` when ingesting untrusted content (LLM-generated, external imports) so items cannot self-elevate their own trust label. Both layers clamp at the trust boundary; non-canonical labels (case variants, typos, LLM hallucinations) fall back to `unknown` with a WARNING log.
+- `BeamMemory.remember()` now clamps `veracity` at entry (same allowlist, same helper). Mirrors `remember_batch` and the C12.b pattern at `hermes_memory_provider` — every public ingest path under BeamMemory is now trust-boundary-uniform.
+- `BeamMemory.recall()` applies the veracity multiplier to **working-memory** results too, not just episodic. Pre-E4 the multiplier only fired on episodic rows, so per-row veracity on working_memory rows had no scoring effect. This unblocks experiment Arms A and C of the BEAM-recovery experiment: without per-row veracity differentiation, the recall scorer cannot rank confident facts above unconfident ones.
 
 ### Added
 
 **E4 — Shared veracity-allowlist primitive**
 - New `mnemosyne.core.veracity_consolidation.VERACITY_ALLOWED` (frozenset of `VERACITY_WEIGHTS` keys) — single source of truth for the canonical labels.
-- New `mnemosyne.core.veracity_consolidation.clamp_veracity(raw, *, context)` helper — normalizes case/whitespace, matches against `VERACITY_ALLOWED`, falls back to `unknown` with a WARNING log when no match. Single primitive for every future trust boundary (importers, batch ingest, MCP tools).
+- New `mnemosyne.core.veracity_consolidation.clamp_veracity(raw, *, context)` helper — normalizes case/whitespace, matches against `VERACITY_ALLOWED`, falls back to `unknown` with a WARNING log (raw value truncated to 80 chars to bound log volume and prevent content leakage from upstream typos). Single primitive for every future trust boundary (importers, batch ingest, MCP tools).
+- `consolidated_at`-style export/import preservation: `working_memory.veracity` is now part of `export_to_dict` / `import_from_dict` so backups round-trip the per-row trust signal. Pre-E4 1.0 exports (no key in dict) default to NULL; the recall scorer's fallback handles NULL via the `unknown` weight, and new writes always carry a canonical label thanks to the clamp.
+
+### Fixed
+
+- `hermes_memory_provider._handle_remember` now uses the central `clamp_veracity` helper instead of an inline duplicate of the allowlist. Eliminates the triple-definition drift risk between the provider, the central frozenset, and the beam.py ImportError fallback.
+
+### Behavior change for legacy callers
+
+- **Score magnitudes shift for working_memory rows.** Pre-E4 working-memory hits got no veracity multiplier; post-E4 the default `unknown` label applies a 0.8x multiplier. If you have downstream tuning against specific score magnitudes (e.g., `MIN_SCORE_THRESHOLD` in the provider's prefetch path), you may want to re-tune. Ranking within the same veracity tier is unchanged. The fix is in service of the experiment goal — making veracity an actual rank signal rather than a global scale.
+- The `MNEMOSYNE_*_WEIGHT` env vars (`STATED_WEIGHT`, `INFERRED_WEIGHT`, etc.) now affect working-memory scoring too. Pre-E4 they only applied to episodic.
 
 ### Notes for callers
 
-- Existing `remember_batch(items)` calls without the new `veracity` kwarg keep their current behavior: rows default to `unknown` via the column DEFAULT, and the new working-memory veracity multiplier (0.8 for `unknown`) applies uniformly across the batch. No code changes required at call sites — but if you want batch-ingested content to score higher than the `unknown` floor, supply `veracity="stated"` (or per-item) at write time.
-- `hermes_memory_provider/__init__.py:504` still defines its own `_VERACITY_ALLOWED` inline. It now duplicates `VERACITY_ALLOWED` from `veracity_consolidation.py`; folding the two together is a clean follow-up for whichever PR next touches the provider's trust boundary.
+- Existing `remember_batch(items)` calls without the new kwargs keep their behavior: rows default to `unknown`. To enable per-row trust differentiation at write time, supply `veracity="stated"` (per-batch default) or per-item `{"veracity": ...}`.
+- For untrusted ingest paths (LLM output, external imports), use `force_veracity=True` to defend against per-item label escalation.
+- If `mnemosyne.core.veracity_consolidation` is unavailable for any reason (stripped install, broken import), `beam.py` falls back to an inline clamp that logs ONE warning at import time so the degraded mode is visible in startup logs.
 
 ## [2.5] — 2026-05-10
 

@@ -236,3 +236,216 @@ class TestRememberBatchVeracity:
         assert len(ids) == 1
         # Default behavior: unknown, no warning.
         assert _veracity_for(temp_db, ids[0]) == "unknown"
+
+    def test_remember_batch_force_veracity_ignores_per_item(self, temp_db, caplog):
+        """[Codex adversarial] force_veracity=True locks the method
+        default and IGNORES per-item veracity. Defends against the
+        retrieval-poisoning path where an importer calls
+        remember_batch(items, veracity='imported') but an item self-
+        elevates with veracity='stated'."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        with caplog.at_level(logging.WARNING):
+            ids = beam.remember_batch(
+                [
+                    {"content": "trusted content", "source": "test"},
+                    {"content": "tries to elevate", "source": "test", "veracity": "stated"},
+                    {"content": "tries to lie low", "source": "test", "veracity": "unknown"},
+                ],
+                veracity="imported",
+                force_veracity=True,
+            )
+        # All three rows must carry the method-level 'imported' label,
+        # NOT the per-item override.
+        for mid in ids:
+            assert _veracity_for(temp_db, mid) == "imported", (
+                f"force_veracity=True did not enforce method default; "
+                f"row {mid} got {_veracity_for(temp_db, mid)!r}"
+            )
+        # Each ignored per-item override should produce a WARNING so
+        # the operator can audit attempts.
+        ignored_warns = [
+            r for r in caplog.records
+            if "force_veracity" in r.message and "ignoring per-item" in r.message
+        ]
+        assert len(ignored_warns) == 2, (
+            f"expected 2 ignored-override warnings (for stated + unknown), "
+            f"got {len(ignored_warns)}: {[w.message for w in ignored_warns]}"
+        )
+
+    def test_remember_batch_force_veracity_default_false(self, temp_db):
+        """Sanity: force_veracity defaults to False, preserving per-item
+        override behavior. No silent flip in defaults."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = beam.remember_batch(
+            [
+                {"content": "uses method default", "source": "test"},
+                {"content": "overrides", "source": "test", "veracity": "stated"},
+            ],
+            veracity="imported",
+        )
+        assert _veracity_for(temp_db, ids[0]) == "imported"
+        assert _veracity_for(temp_db, ids[1]) == "stated"
+
+    def test_recall_full_veracity_ordering(self, temp_db):
+        """[testing specialist] Pin the full canonical multiplier order.
+        Pre-E4 only the stated > unknown pair was implicitly tested;
+        a regression that swapped weights between inferred / tool /
+        imported would slip through. E4 is the rank-signal unlocker
+        for the experiment, so the full ordering deserves a guard."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        rare_token = "veraxxxordtest"
+        # One row per canonical label, distinct content but same rare token.
+        for label in ("stated", "inferred", "imported", "unknown", "tool"):
+            beam.remember_batch(
+                [{"content": f"{rare_token} {label}-tagged content", "source": "t"}],
+                veracity=label,
+            )
+
+        results = beam.recall(rare_token, top_k=20)
+        by_label = {r.get("veracity"): r.get("score", 0.0) for r in results}
+        # All five canonical labels should appear.
+        missing = {"stated", "inferred", "imported", "unknown", "tool"} - set(by_label.keys())
+        assert not missing, f"recall missed labels: {missing}; got {by_label}"
+
+        # Expected descending order per VERACITY_WEIGHTS:
+        # stated=1.0 > unknown=0.8 > inferred=0.7 > imported=0.6 > tool=0.5
+        ordered = sorted(by_label.items(), key=lambda kv: -kv[1])
+        descending_labels = [label for label, _ in ordered]
+        expected = ["stated", "unknown", "inferred", "imported", "tool"]
+        assert descending_labels == expected, (
+            f"veracity multiplier order regression: got {descending_labels} "
+            f"expected {expected}. Raw scores: {by_label}"
+        )
+
+    def test_recall_handles_null_veracity_in_legacy_row(self, temp_db):
+        """[testing specialist] Legacy rows (pre-veracity-column or
+        hand-edited) may have NULL veracity. The recall multiplier's
+        veracity_map.get(..., UNKNOWN_WEIGHT) fallback must handle it
+        without crashing, applying the UNKNOWN_WEIGHT multiplier."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Insert a row directly via cursor with NULL veracity.
+        conn = sqlite3.connect(str(temp_db))
+        from datetime import datetime
+        conn.execute(
+            "INSERT INTO working_memory "
+            "(id, content, source, timestamp, session_id, importance, veracity) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            ("null-ver-1", "legacy null-veracity nullycontent", "test",
+             datetime.now().isoformat(), "s1", 0.5),
+        )
+        conn.commit()
+        conn.close()
+
+        results = beam.recall("nullycontent", top_k=10)
+        assert results, "row with NULL veracity not surfaced"
+        # The defensive fallback should treat NULL as 'unknown' and
+        # apply UNKNOWN_WEIGHT — score must be finite and > 0.
+        for r in results:
+            assert r.get("score", 0.0) > 0, (
+                f"NULL-veracity row scored 0/non-finite: {r}"
+            )
+
+    def test_recall_handles_junk_veracity_in_row(self, temp_db):
+        """[testing specialist] Defense-in-depth at recall: even if a
+        non-canonical label landed in the DB via a non-clamping path
+        (raw INSERT, schema migration, hand-edit), the recall scorer
+        must fall back to UNKNOWN_WEIGHT and not crash."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(str(temp_db))
+        from datetime import datetime
+        conn.execute(
+            "INSERT INTO working_memory "
+            "(id, content, source, timestamp, session_id, importance, veracity) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("junk-ver-1", "junkverlabel contains rare token zzzqqqx", "test",
+             datetime.now().isoformat(), "s1", 0.5, "totally_made_up_label"),
+        )
+        conn.commit()
+        conn.close()
+
+        results = beam.recall("zzzqqqx", top_k=10)
+        assert results, "row with junk veracity not surfaced"
+        for r in results:
+            if r.get("id") == "junk-ver-1":
+                # Junk veracity should fall through to UNKNOWN_WEIGHT;
+                # score must be positive and finite.
+                assert r.get("score", 0.0) > 0
+                break
+        else:
+            pytest.fail(f"junk-ver-1 not in results: {results}")
+
+    def test_export_import_preserves_veracity(self, temp_db):
+        """[Codex adversarial] Backup round-trip must preserve
+        per-row veracity. Pre-E4 fix, export omitted the column —
+        restored rows collapsed to 'unknown' and lost their rank
+        signal. Same shape as the E3 consolidated_at gap."""
+        import tempfile as _tempfile
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = beam.remember_batch(
+            [
+                {"content": "stated content", "source": "t"},
+                {"content": "tool observation", "source": "t"},
+            ],
+            veracity="stated",
+        )
+        # Differentiate the second row.
+        beam.conn.execute(
+            "UPDATE working_memory SET veracity = 'tool' WHERE id = ?",
+            (ids[1],),
+        )
+        beam.conn.commit()
+
+        # Read originals.
+        original = {mid: _veracity_for(temp_db, mid) for mid in ids}
+
+        # Export → fresh DB → import.
+        export = beam.export_to_dict()
+        with _tempfile.TemporaryDirectory() as td:
+            dest_path = Path(td) / "restored.db"
+            beam_dest = BeamMemory(session_id="s1", db_path=dest_path)
+            beam_dest.import_from_dict(export)
+
+            for mid in ids:
+                restored = _veracity_for(dest_path, mid)
+                assert restored == original[mid], (
+                    f"export/import lost veracity for {mid}: "
+                    f"original={original[mid]!r}, restored={restored!r}"
+                )
+
+    def test_remember_method_also_clamps(self, temp_db, caplog):
+        """[security specialist + Codex] BeamMemory.remember() now
+        clamps veracity too — consistency with remember_batch and
+        the C12.b pattern at the provider boundary."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        with caplog.at_level(logging.WARNING):
+            beam.remember("content one", source="t", veracity="STATED")
+            beam.remember("content two", source="t", veracity="random_garbage")
+
+        # Case-folded canonical landed.
+        rows = sqlite3.connect(str(temp_db)).execute(
+            "SELECT content, veracity FROM working_memory ORDER BY content"
+        ).fetchall()
+        by_content = {c: v for c, v in rows}
+        assert by_content["content one"] == "stated"
+        # Non-canonical clamped.
+        assert by_content["content two"] == "unknown"
+        # Warning fired for the clamp.
+        assert any(
+            "random_garbage" in r.message for r in caplog.records
+        ), f"no clamp warning for remember(): {caplog.records}"
+
+    def test_clamp_truncates_long_raw_value_in_log(self, caplog):
+        """[Codex / Claude adv] Bad veracity strings can be arbitrarily
+        long (e.g. an LLM dumping the full prompt into the slot). The
+        WARNING log must truncate to avoid log flood / content leak."""
+        long_garbage = "x" * 500
+        with caplog.at_level(logging.WARNING):
+            result = clamp_veracity(long_garbage, context="test")
+        assert result == "unknown"
+        warn = next((r for r in caplog.records if r.levelname == "WARNING"), None)
+        assert warn is not None
+        # 80-char cap + truncation marker should appear, but full
+        # 500-char value must NOT.
+        assert long_garbage not in warn.message
+        assert "[truncated]" in warn.message
