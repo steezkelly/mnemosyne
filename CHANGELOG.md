@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [2.5] — 2026-05-10
+
+### Added
+
+**NAI-0 Algorithmic Sprint**
+- `BeamMemory.format_context(results, format="bullet"|"json")` — structured context formatting
+- `BeamMemory._sandwich_order()` — U-shaped attention ordering (high-first, medium-middle, high-last)
+- `BeamMemory._fact_line()` — clean one-line fact format with date, source, confidence
+- `BeamMemory._format_context_json()` / `_format_context_bullet()` — JSON and markdown output
+- RRF (Reciprocal Rank Fusion) in `PolyphonicRecallEngine._combine_voices()` with k=60 constant
+- Covering indexes: `idx_em_scope_imp`, `idx_wm_session_recall`, `idx_mem_emb_type`
+- `tools/bench_nai0.py` — minimal 20-question benchmark for quick before/after measurement
+
+**Self-Healing Quality Pipeline** (`scripts/heal_quality.py`, PR #67 by ether-btc)
+- Detects degraded episodic memory entries (bullet-format, <300 chars) and repairs them via a 4-stage LLM-as-Judge closed loop: Extract → Generate → Judge → Repair
+- Fault taxonomy: `truncated`, `generic`, `missing_facts`, `wrong_format`
+- Judge scores 4 dimensions (factual density, format compliance, length sufficiency, grounding) each 0-100
+- Repair strategies are fault-specific: context doubling, specificity enforcement, fact injection, format rewrite
+- Loop with `MAX_RETRIES` (default 3) and automatic escalation to stronger model after 2 failures
+- Quality provenance in `metadata_json`: `quality_score`, `judge_model`, `consolidated_at`, `fault_before_repair`, `retry_loop_count`
+- Configurable via env: `MNEMOSYNE_HEAL_JUDGE_THRESHOLD`, `MNEMOSYNE_HEAL_MAX_RETRIES`, `MNEMOSYNE_HEAL_MIN_LEN`, `MNEMOSYNE_HEAL_BUDGET`, `MNEMOSYNE_HEAL_ESCALATE_AFTER`
+- Works with any LLM backend (MiniMax M2.7 via mmx-cli, local GGUF, or remote OpenAI-compatible API)
+- CLI: `python scripts/heal_quality.py [--detect-only] [--entry-id ID] [--dry-run]`
+
+**Chunked LLM Summarization** (`mnemosyne/core/local_llm.py`)
+- Splits large memory lists into context-window-sized chunks before summarization
+- Two-pass: summarize each chunk individually, then consolidate chunk summaries
+- Fixes truncation issues with smaller models (Qwen2.5-1.5B) on large sessions
+
+### Changed
+- `BeamMemory.recall()` default `top_k`: 5 → 40
+- Polyphonic recall voice combination: weighted average → position-based RRF
+- `mnemosyne/__init__.py`: version bump to 2.5.0
+
 ## [2.4] — 2026-05-07
 
 ### Added

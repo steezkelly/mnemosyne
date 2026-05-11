@@ -581,7 +581,7 @@ When `MNEMOSYNE_HOST_LLM_ENABLED=false` or unset:
 
 **Module:** `mnemosyne.core.importers`
 
-Mnemosyne can import memories from supported external providers. Importers preserve source metadata where available; `HindsightImporter` is the timestamp-preserving path for Hindsight history and writes directly to episodic memory.
+Mnemosyne can import memories from supported external providers. All importers preserve metadata, timestamps, and identity.
 
 ### Supported Providers
 

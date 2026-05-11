@@ -198,6 +198,37 @@ class Mnemosyne:
             memories = self.get_all_memories()
         return self.patterns.summarize_patterns(memories)
 
+    def get_all_memories(self) -> List[Dict]:
+        """Return all working + episodic rows for pattern analysis.
+
+        Scoped to the active session (and global memories), with the same
+        validity filters that get_context() and recall() apply: invalidated
+        and expired memories are excluded so retracted notes do not skew
+        pattern detection.
+        """
+        now = datetime.now().isoformat()
+        cursor = self.beam.conn.cursor()
+        cursor.execute("""
+            SELECT id, content, source, timestamp, session_id, importance
+            FROM working_memory
+            WHERE (session_id = ? OR scope = 'global')
+              AND (valid_until IS NULL OR valid_until > ?)
+              AND superseded_by IS NULL
+        """, (self.session_id, now))
+        rows = [dict(row) for row in cursor.fetchall()]
+        seen_ids = {r["id"] for r in rows}
+        cursor.execute("""
+            SELECT id, content, source, timestamp, session_id, importance
+            FROM episodic_memory
+            WHERE (session_id = ? OR scope = 'global')
+              AND (valid_until IS NULL OR valid_until > ?)
+              AND superseded_by IS NULL
+        """, (self.session_id, now))
+        for row in cursor.fetchall():
+            if row["id"] not in seen_ids:
+                rows.append(dict(row))
+        return rows
+
     # ─── Phase 8: Delta Sync ──────────────────────────────────────
 
     @property
@@ -246,9 +277,17 @@ class Mnemosyne:
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
         """
-        # BEAM write first (generates its own ID)
-        memory_id = self.beam.remember(content, source=source, importance=importance, metadata=metadata,
-                           valid_until=valid_until, scope=scope)
+        # BEAM write first (generates its own ID). Extract flags are passed
+        # through so BeamMemory's canonical _extract_and_store_entities and
+        # _extract_and_store_facts helpers run — these populate the `facts`
+        # table that fact_recall() queries (the wrapper used to reimplement
+        # only the triples half of extraction inline, leaving facts table
+        # writes silently skipped — see C12.a).
+        memory_id = self.beam.remember(
+            content, source=source, importance=importance, metadata=metadata,
+            valid_until=valid_until, scope=scope,
+            extract_entities=extract_entities, extract=extract,
+        )
         timestamp = datetime.now().isoformat()
 
         # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
@@ -272,41 +311,12 @@ class Mnemosyne:
 
         self.conn.commit()
 
-        # BEAM write (reuse the same ID so legacy and working-memory rows stay in sync)
-        self.beam.remember(content, source=source, importance=importance, metadata=metadata,
-                           valid_until=valid_until, scope=scope, memory_id=memory_id)
-
-        # Entity extraction (best-effort, never fails the memory write)
-        if extract_entities:
-            try:
-                from mnemosyne.core.entities import extract_entities_regex
-                from mnemosyne.core.triples import TripleStore
-                entities = extract_entities_regex(content)
-                if entities:
-                    triples = TripleStore(db_path=self.db_path)
-                    for entity in entities:
-                        triples.add(
-                            subject=memory_id,
-                            predicate="mentions",
-                            object=entity,
-                            source=source,
-                            confidence=0.8
-                        )
-            except Exception:
-                pass  # Entity extraction is best-effort
-
-        # Structured fact extraction (best-effort, never fails the memory write)
-        if extract:
-            try:
-                from mnemosyne.core.extraction import extract_facts_safe
-                from mnemosyne.core.triples import TripleStore
-                facts = extract_facts_safe(content)
-                if facts:
-                    triples = TripleStore(db_path=self.db_path)
-                    triples.add_facts(memory_id, facts, source=source, confidence=0.7)
-            except Exception:
-                pass  # Fact extraction is best-effort
-
+        # The first BEAM write already inserted the working_memory row with
+        # the correct memory_id (we used it for the legacy dual-write above).
+        # A second beam.remember call would only re-run the dedup branch and
+        # _ingest_graph_and_veracity — duplicating gist/fact graph edges and
+        # bumping mention_count for what is a single user-level remember. So
+        # this function returns directly after the legacy write.
         return memory_id
 
     def recall(self, query: str, top_k: int = 5, *,
@@ -370,6 +380,28 @@ class Mnemosyne:
         beam_ep = self.beam.get_episodic_stats(author_id=author_id, author_type=author_type,
                                                 channel_id=channel_id)
 
+        # Triples count — table is created lazily by TripleStore.init_triples;
+        # if it does not exist yet (no triple has ever been written), report 0.
+        # Narrow the suppression to the missing-table case so DB locks, I/O
+        # errors, and corruption are not silently turned into "0 triples".
+        triple_total = 0
+        try:
+            cursor.execute("SELECT COUNT(*) FROM triples")
+            triple_total = cursor.fetchone()[0]
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e).lower():
+                raise
+
+        # Bank list — scoped to the same data dir as this Mnemosyne instance so
+        # a per-bank or per-tmp-dir caller does not get bank names from the
+        # default ~/.hermes tree. Banks live at <data_dir>/banks/, where
+        # data_dir is the parent of self.db_path.
+        try:
+            from mnemosyne.core.banks import BankManager
+            banks = BankManager(data_dir=Path(self.db_path).parent).list_banks()
+        except Exception:
+            banks = ["default"]
+
         return {
             "total_memories": total_legacy,
             "total_sessions": sessions,
@@ -377,9 +409,11 @@ class Mnemosyne:
             "last_memory": last[0] if last else None,
             "database": str(self.db_path),
             "mode": "beam",
+            "banks": banks,
             "beam": {
                 "working_memory": beam_wm,
-                "episodic_memory": beam_ep
+                "episodic_memory": beam_ep,
+                "triples": {"total": triple_total},
             }
         }
 
@@ -525,6 +559,9 @@ class Mnemosyne:
 
         with open(input_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("Import file must contain a Mnemosyne export object")
 
         # Validate
         meta = data.get("mnemosyne_export", {})

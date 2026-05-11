@@ -55,7 +55,11 @@ REMEMBER_SCHEMA = {
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
-        "extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match)."
+        "extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match). "
+        "Use extract=True to also pull subject-predicate-object fact triples via LLM "
+        "for fact-aware recall. Use veracity to tag confidence: 'stated' for direct "
+        "user assertions, 'tool' for deterministic tool output, 'inferred' for derived "
+        "guesses; 'unknown' (default) gets no recall boost."
     ),
     "parameters": {
         "type": "object",
@@ -66,6 +70,9 @@ REMEMBER_SCHEMA = {
             "scope": {"type": "string", "description": "'session' (default) or 'global'.", "default": "session"},
             "valid_until": {"type": "string", "description": "Optional expiry date YYYY-MM-DD.", "default": ""},
             "extract_entities": {"type": "boolean", "description": "Extract named entities for fuzzy recall. Default False.", "default": False},
+            "extract": {"type": "boolean", "description": "Extract subject-predicate-object fact triples via LLM for fact-aware recall. Default False.", "default": False},
+            "metadata": {"type": "object", "description": "Optional dict of additional fields (source_doc, tags, page, etc.). Default empty.", "default": {}},
+            "veracity": {"type": "string", "description": "Confidence label: 'stated' | 'inferred' | 'tool' | 'imported' | 'unknown'. Default 'unknown'.", "default": "unknown"},
         },
         "required": ["content"],
     },
@@ -74,9 +81,10 @@ REMEMBER_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "mnemosyne_recall",
     "description": (
-        "Search Mnemosyne for relevant memories. Uses hybrid ranking: 50% vector "
-        "similarity + 30% FTS5 text rank + 20% importance + optional temporal boost. "
-        "Supports temporal weighting to boost recent memories. Returns ranked results."
+        "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
+        "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
+        "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
+        "importance_weight (omit to use environment defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -97,6 +105,18 @@ RECALL_SCHEMA = {
                 "type": "number",
                 "description": "Hours until temporal boost decays by half. Default 24. Lower = faster decay.",
                 "default": 24,
+            },
+            "vec_weight": {
+                "type": "number",
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+            },
+            "fts_weight": {
+                "type": "number",
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+            },
+            "importance_weight": {
+                "type": "number",
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
             },
         },
         "required": ["query"],
@@ -393,6 +413,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
 
+    # Canonical veracity allowlist mirrors VERACITY_WEIGHTS in
+    # mnemosyne/core/veracity_consolidation.py. Anything outside this set
+    # bypasses the recall weighting AND pollutes the contamination filter
+    # (which compares `veracity != 'stated'`), so unknown labels persist as
+    # garbage in the row. Clamp at the trust boundary.
+    _VERACITY_ALLOWED = {"stated", "inferred", "tool", "imported", "unknown"}
+
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         content = args.get("content", "")
         importance = float(args.get("importance", 0.5))
@@ -400,6 +427,18 @@ class MnemosyneMemoryProvider(MemoryProvider):
         scope = args.get("scope", "session")
         valid_until = args.get("valid_until", None) or None
         extract_entities = bool(args.get("extract_entities", False))
+        extract = bool(args.get("extract", False))
+        metadata = args.get("metadata") or None
+        raw_veracity = args.get("veracity", "unknown") or "unknown"
+        veracity_norm = str(raw_veracity).strip().lower()
+        if veracity_norm in self._VERACITY_ALLOWED:
+            veracity = veracity_norm
+        else:
+            logger.warning(
+                "mnemosyne_remember received unknown veracity %r; clamping to 'unknown'",
+                raw_veracity,
+            )
+            veracity = "unknown"
         if not content:
             return json.dumps({"error": "content is required"})
         memory_id = self._beam.remember(
@@ -409,8 +448,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
             scope=scope,
             valid_until=valid_until,
             extract_entities=extract_entities,
+            extract=extract,
+            metadata=metadata,
+            veracity=veracity,
         )
-        return json.dumps({"status": "stored", "memory_id": memory_id, "content_preview": content[:100], "extract_entities": extract_entities})
+        return json.dumps({
+            "status": "stored",
+            "memory_id": memory_id,
+            "content_preview": content[:100],
+            "extract_entities": extract_entities,
+            "extract": extract,
+            "metadata": metadata,
+            "veracity": veracity,
+        })
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
@@ -420,12 +470,23 @@ class MnemosyneMemoryProvider(MemoryProvider):
         temporal_halflife_hours = float(args.get("temporal_halflife", 24))
         if not query:
             return json.dumps({"error": "query is required"})
-        results = self._beam.recall(
-            query, top_k=top_k,
-            temporal_weight=temporal_weight,
-            query_time=query_time,
-            temporal_halflife=temporal_halflife_hours,
-        )
+
+        # Forward configurable scoring weights ONLY when the caller actually
+        # supplied them. beam.recall treats None as "fall back to env var or
+        # default" via _normalize_weights; passing 0.0 / 0.5 / etc. when the
+        # caller didn't ask for tuning would override that resolution and
+        # break MNEMOSYNE_*_WEIGHT env-var deployments. See issue #45.
+        recall_kwargs: Dict[str, Any] = {
+            "top_k": top_k,
+            "temporal_weight": temporal_weight,
+            "query_time": query_time,
+            "temporal_halflife": temporal_halflife_hours,
+        }
+        for weight_key in ("vec_weight", "fts_weight", "importance_weight"):
+            if weight_key in args:
+                recall_kwargs[weight_key] = args[weight_key]
+
+        results = self._beam.recall(query, **recall_kwargs)
         return json.dumps({"query": query, "count": len(results), "temporal_weight": temporal_weight, "results": results})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
