@@ -1046,6 +1046,16 @@ class BeamMemory:
                   memory_type,
                   existing_id, self.session_id))
             self.conn.commit()
+            # Run the same entity/fact extraction the new-row path runs, so
+            # backfill calls — `mem.remember(same_content, extract=True)` on
+            # an already-existing row — actually populate the triples and
+            # facts tables. Without this the dedup early-return silently
+            # skips everything `extract=True` advertises, breaking the
+            # contract on duplicate-content writes (see C12.a /review note).
+            if extract_entities:
+                _extract_and_store_entities(self, existing_id, content)
+            if extract:
+                _extract_and_store_facts(self, existing_id, content, source)
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
             return existing_id
@@ -2280,14 +2290,25 @@ class BeamMemory:
         except Exception:
             return []
 
-        for row in fact_rows:
-            fact_text = row["object"] if row["object"] else f"{row['subject']} {row['predicate']} {row['object']}"
+        for raw_row in fact_rows:
+            # sqlite3.Row supports bracket access but not .get(); convert to
+            # dict so the column-with-default reads below work. Without this
+            # conversion fact_recall crashes the moment the facts table
+            # contains rows — a latent bug that was masked while the
+            # Mnemosyne.remember(extract=True) wrapper never populated the
+            # table (see C12.a).
+            row = dict(raw_row)
+            confidence = row.get("confidence")
+            subject = row.get("subject")
+            predicate = row.get("predicate")
+            obj = row.get("object")
+            fact_text = obj if obj else f"{subject} {predicate} {obj}"
             results.append({
                 "content": fact_text,
-                "score": row.get("confidence", 0.5),
+                "score": confidence if confidence is not None else 0.5,
                 "fact_id": row["fact_id"],
-                "subject": row.get("subject", ""),
-                "predicate": row.get("predicate", ""),
+                "subject": subject if subject is not None else "",
+                "predicate": predicate if predicate is not None else "",
             })
 
         return results

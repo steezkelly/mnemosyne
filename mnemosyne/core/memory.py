@@ -277,9 +277,17 @@ class Mnemosyne:
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
         """
-        # BEAM write first (generates its own ID)
-        memory_id = self.beam.remember(content, source=source, importance=importance, metadata=metadata,
-                           valid_until=valid_until, scope=scope)
+        # BEAM write first (generates its own ID). Extract flags are passed
+        # through so BeamMemory's canonical _extract_and_store_entities and
+        # _extract_and_store_facts helpers run — these populate the `facts`
+        # table that fact_recall() queries (the wrapper used to reimplement
+        # only the triples half of extraction inline, leaving facts table
+        # writes silently skipped — see C12.a).
+        memory_id = self.beam.remember(
+            content, source=source, importance=importance, metadata=metadata,
+            valid_until=valid_until, scope=scope,
+            extract_entities=extract_entities, extract=extract,
+        )
         timestamp = datetime.now().isoformat()
 
         # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
@@ -303,41 +311,12 @@ class Mnemosyne:
 
         self.conn.commit()
 
-        # BEAM write (reuse the same ID so legacy and working-memory rows stay in sync)
-        self.beam.remember(content, source=source, importance=importance, metadata=metadata,
-                           valid_until=valid_until, scope=scope, memory_id=memory_id)
-
-        # Entity extraction (best-effort, never fails the memory write)
-        if extract_entities:
-            try:
-                from mnemosyne.core.entities import extract_entities_regex
-                from mnemosyne.core.triples import TripleStore
-                entities = extract_entities_regex(content)
-                if entities:
-                    triples = TripleStore(db_path=self.db_path)
-                    for entity in entities:
-                        triples.add(
-                            subject=memory_id,
-                            predicate="mentions",
-                            object=entity,
-                            source=source,
-                            confidence=0.8
-                        )
-            except Exception:
-                pass  # Entity extraction is best-effort
-
-        # Structured fact extraction (best-effort, never fails the memory write)
-        if extract:
-            try:
-                from mnemosyne.core.extraction import extract_facts_safe
-                from mnemosyne.core.triples import TripleStore
-                facts = extract_facts_safe(content)
-                if facts:
-                    triples = TripleStore(db_path=self.db_path)
-                    triples.add_facts(memory_id, facts, source=source, confidence=0.7)
-            except Exception:
-                pass  # Fact extraction is best-effort
-
+        # The first BEAM write already inserted the working_memory row with
+        # the correct memory_id (we used it for the legacy dual-write above).
+        # A second beam.remember call would only re-run the dedup branch and
+        # _ingest_graph_and_veracity — duplicating gist/fact graph edges and
+        # bumping mention_count for what is a single user-level remember. So
+        # this function returns directly after the legacy write.
         return memory_id
 
     def recall(self, query: str, top_k: int = 5, *,
