@@ -51,10 +51,29 @@ except ImportError:
     EpisodicGraph = None
     GraphEdge = None
 try:
-    from mnemosyne.core.veracity_consolidation import VeracityConsolidator, VERACITY_WEIGHTS
+    from mnemosyne.core.veracity_consolidation import (
+        VeracityConsolidator,
+        VERACITY_WEIGHTS,
+        clamp_veracity,
+    )
 except ImportError:
     VeracityConsolidator = None
     VERACITY_WEIGHTS = {}
+
+    def clamp_veracity(raw, *, context: str = "veracity") -> str:
+        """Fallback when veracity_consolidation is unavailable.
+        Mirrors the canonical helper's API and clamps everything to
+        'unknown' silently — the column DEFAULT.
+        """
+        if raw is None or not str(raw).strip():
+            return "unknown"
+        norm = str(raw).strip().lower()
+        # Without the canonical allowlist available, fall back to the
+        # known-safe set inline. Keeps the runtime contract intact
+        # even in stripped-down installs.
+        if norm in {"stated", "inferred", "tool", "imported", "unknown"}:
+            return norm
+        return "unknown"
 
 try:
     import numpy as np
@@ -1148,14 +1167,37 @@ class BeamMemory:
                          source=source, importance=importance, metadata=metadata)
         return memory_id
 
-    def remember_batch(self, items: List[Dict]) -> List[str]:
+    def remember_batch(self, items: List[Dict],
+                       *, veracity: Optional[str] = None) -> List[str]:
         """
         Batch insert into working_memory for high-throughput ingestion.
-        Each item dict should have keys: content, source, importance, metadata (optional).
+        Each item dict should have keys: content, source, importance,
+        metadata (optional), veracity (optional).
+
+        veracity (method-level kwarg): default applied to items that
+            don't supply their own `veracity` key. None → 'unknown'.
+            Per-item `veracity` in the item dict overrides this default.
+            All values are clamped to the canonical allowlist
+            (VERACITY_ALLOWED in mnemosyne.core.veracity_consolidation)
+            via clamp_veracity — non-canonical labels emit a WARNING
+            and fall back to 'unknown'. Mirrors the C12.b clamp pattern
+            at the hermes_memory_provider trust boundary; remember_batch
+            is the high-throughput path used by importers, BEAM
+            benchmark adapter, and batch ingest CLIs where label
+            quality varies.
+
+            Pre-E4 the column defaulted to 'unknown' for every batch
+            row; recall's veracity multiplier collapsed to a constant
+            0.8 (global scale factor instead of rank signal).
         """
         cursor = self.conn.cursor()
         ids = []
         timestamp = datetime.now().isoformat()
+        # Clamp the method-level default once, not per row — operators
+        # who pass a bad default should see one warning, not N.
+        default_veracity = clamp_veracity(
+            veracity, context="remember_batch (default)"
+        )
         for item in items:
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
@@ -1167,10 +1209,19 @@ class BeamMemory:
                     item_type = result.memory_type.value
                 except Exception:
                     pass
+            # Per-item override clamped at the trust boundary. If the
+            # item omits `veracity`, fall through to the method-level
+            # default (already clamped above).
+            if "veracity" in item:
+                item_veracity = clamp_veracity(
+                    item["veracity"], context="remember_batch (per-item)"
+                )
+            else:
+                item_veracity = default_veracity
             cursor.execute("""
                 INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
-                author_id, author_type, channel_id, memory_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                author_id, author_type, channel_id, memory_type, veracity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 memory_id,
                 item["content"],
@@ -1182,7 +1233,8 @@ class BeamMemory:
                 item.get("author_id", self.author_id),
                 item.get("author_type", self.author_type),
                 item.get("channel_id", self.channel_id),
-                item_type
+                item_type,
+                item_veracity,
             ))
         self.conn.commit()
         
@@ -2222,6 +2274,18 @@ class BeamMemory:
                     r["veracity"] = ep_veracity
                     r["score"] *= weight_map.get(ep_tier, 1.0)
                     r["score"] *= veracity_map.get(ep_veracity, UNKNOWN_WEIGHT)
+
+        # [E4] Apply the veracity multiplier to working_memory results
+        # too. Pre-E4 the multiplier was episodic-only, so per-row
+        # veracity on working_memory rows (now populated by
+        # remember_batch with per-row labels) had no scoring effect —
+        # batch-ingested 'stated' content didn't rank above 'unknown'.
+        # The row dicts already carry "veracity" from the SELECT
+        # populated earlier in this function, so no second query needed.
+        for r in results:
+            if r.get("tier") == "working":
+                wm_veracity = r.get("veracity") or "unknown"
+                r["score"] *= veracity_map.get(wm_veracity, UNKNOWN_WEIGHT)
 
         results.sort(key=lambda x: x["score"], reverse=True)
         final_results = results[:top_k]
