@@ -65,9 +65,12 @@ class TestE5FeatureFlag:
         """[E5] When MNEMOSYNE_POLYPHONIC_RECALL is unset or '0', recall
         runs the existing linear scorer. Production behavior unchanged.
 
-        The signal that we're on the linear path: result dicts do NOT
-        carry a `voice_scores` field (that's only populated by the
-        polyphonic engine)."""
+        Post-Gap-G (May 2026): both engines now populate `voice_scores`
+        for analysis parity, but with different keys. Linear keys are
+        {vec, fts, keyword, importance, recency_decay}; polyphonic keys
+        are {vector, graph, fact, temporal}. The signal that linear ran
+        is the absence of polyphonic-specific keys, not the absence of
+        the dict itself."""
         monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
 
         beam = BeamMemory(session_id="e5-off", db_path=temp_db)
@@ -78,9 +81,11 @@ class TestE5FeatureFlag:
 
         results = beam.recall("deploy", top_k=10)
         assert results, "recall returned 0 — sanity check"
+        _POLYPHONIC_KEYS = {"vector", "graph", "fact", "temporal"}
         for r in results:
-            assert "voice_scores" not in r, (
-                f"linear scorer leaked voice_scores into result: {r}"
+            vs = r.get("voice_scores", {})
+            assert not (set(vs.keys()) & _POLYPHONIC_KEYS), (
+                f"linear path leaked polyphonic voice keys: {set(vs.keys())}"
             )
 
     def test_flag_off_explicit_zero(self, temp_db, monkeypatch, disable_llm):
@@ -94,8 +99,10 @@ class TestE5FeatureFlag:
         ])
 
         results = beam.recall("explicit-zero", top_k=10)
+        _POLYPHONIC_KEYS = {"vector", "graph", "fact", "temporal"}
         for r in results:
-            assert "voice_scores" not in r
+            vs = r.get("voice_scores", {})
+            assert not (set(vs.keys()) & _POLYPHONIC_KEYS)
 
     def test_flag_on_uses_polyphonic_engine(
         self, temp_db, monkeypatch, disable_llm
@@ -148,13 +155,22 @@ class TestE5FeatureFlag:
         monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
         off_results = beam.recall("Alice toggle", top_k=10)
 
-        # ON path produces voice_scores; OFF path doesn't.
-        on_has_voices = any(r.get("voice_scores") for r in on_results)
-        off_has_voices = any("voice_scores" in r for r in off_results)
-        assert on_has_voices, (
+        # Post-Gap-G: both engines populate voice_scores with different
+        # keys. Engine identity is the polyphonic-specific keys
+        # (vector/graph/fact/temporal), not the field's mere presence.
+        _POLYPHONIC_KEYS = {"vector", "graph", "fact", "temporal"}
+        on_has_polyphonic_keys = any(
+            (set(r.get("voice_scores", {}).keys()) & _POLYPHONIC_KEYS)
+            for r in on_results
+        )
+        off_has_polyphonic_keys = any(
+            (set(r.get("voice_scores", {}).keys()) & _POLYPHONIC_KEYS)
+            for r in off_results
+        )
+        assert on_has_polyphonic_keys, (
             f"flag=ON didn't engage the engine. on_results={on_results}"
         )
-        assert not off_has_voices, "flag=OFF still ran the engine"
+        assert not off_has_polyphonic_keys, "flag=OFF still ran the engine"
 
 
 class TestE5EnginePlumbing:

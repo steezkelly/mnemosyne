@@ -96,6 +96,7 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _ENV_TRUTHY_VALUES
 BENCHMARK_QUERIES_PER_CONV = 50  # Max probing questions per conversation
 RESULTS_FILE = PROJECT_ROOT / "results" / "beam_e2e_results.json"
+PAIRED_OUTCOMES_FILE = PROJECT_ROOT / "results" / "paired_outcomes.jsonl"
 
 # Memory abilities tested by BEAM (10 dimensions)
 BEAM_ABILITIES = [
@@ -1659,6 +1660,13 @@ def main():
                         help="Download data and print stats, don't evaluate")
     parser.add_argument("--use-cloud", action="store_true",
                         help="Enable LLM fact extraction (cloud tier). Requires OPENROUTER_API_KEY.")
+    parser.add_argument("--config-id", default=None,
+                        help="Run identifier written into the paired-outcomes "
+                             "JSONL alongside results JSON. Defaults to a "
+                             "short hash of the MNEMOSYNE_* env snapshot — "
+                             "useful for distinguishing back-to-back ablation "
+                             "phases. Override when you want a human-readable "
+                             "label (e.g. 'phase3a-no-fact-voice').")
     parser.add_argument("--allow-harness-oracles", action="store_true",
                         help="Opt out of the pure-recall safety check that requires "
                              "MNEMOSYNE_BENCHMARK_PURE_RECALL=1 (or --pure-recall). The "
@@ -1703,6 +1711,25 @@ def main():
         if "KEY" in k or "TOKEN" in k or "SECRET" in k:
             v = "***redacted***"
         print(f"    {k}={v}")
+
+    # Gap E: config_id labels each row in paired_outcomes.jsonl so a
+    # downstream notebook can paired-bootstrap CIs across multiple A/B
+    # runs without re-parsing the main results JSON. Default to a short
+    # hash of the env snapshot (deterministic for identical configs);
+    # override via `--config-id` for human-readable labels (e.g.,
+    # 'phase3a-no-fact-voice').
+    import hashlib
+    if args.config_id:
+        _config_id = args.config_id
+    else:
+        _env_canonical = "\n".join(
+            f"{k}={v}" for k, v in sorted(_benchmark_env_snapshot.items())
+            if "KEY" not in k and "TOKEN" not in k and "SECRET" not in k
+        )
+        _config_id = "cfg-" + hashlib.sha256(_env_canonical.encode("utf-8")).hexdigest()[:10]
+    _run_started_at = datetime.now(timezone.utc).isoformat()
+    print(f"  Config ID: {_config_id}")
+    print(f"  Run started: {_run_started_at}")
 
     # Reset recall + extraction diagnostics so per-run counters are clean. The
     # snapshots are captured at the end of main() and written into results JSON.
@@ -1812,6 +1839,28 @@ def main():
             # snapshot + diagnostic snapshots so post-hoc analysis can attribute
             # score deltas to specific configurations without re-running.
             os.makedirs(RESULTS_FILE.parent, exist_ok=True)
+
+            # Gap E: append per-question paired outcomes to a flat JSONL
+            # so downstream analysis can paired-bootstrap CIs across
+            # multiple A/B runs. Each line records (config_id, qid,
+            # ability, score, correct, scale, ts) — enough to compute
+            # paired deltas without re-parsing the main results JSON.
+            # Append-only with run_started_at + config_id means multiple
+            # phases accumulate in one file; analyst filters by config_id.
+            with open(PAIRED_OUTCOMES_FILE, "a") as paired_f:
+                for question in conv_result.get("results", []):
+                    qid = question.get("qid")
+                    score = question.get("score", 0.0)
+                    paired_f.write(json.dumps({
+                        "config_id": _config_id,
+                        "run_started_at": _run_started_at,
+                        "scale": conv_result.get("scale"),
+                        "conversation_id": conv_result.get("conversation_id"),
+                        "qid": qid,
+                        "ability": question.get("ability"),
+                        "score": score,  # raw rubric score 0.0-1.0
+                        "correct": score >= 0.5,  # boolean threshold for paired tests
+                    }) + "\n")
             _recall_diag = None
             _extraction_diag = None
             try:
@@ -1827,6 +1876,8 @@ def main():
 
             metadata = {
                 "date": datetime.now(timezone.utc).isoformat(),
+                "run_started_at": _run_started_at,
+                "config_id": _config_id,
                 "model": args.model,
                 "judge_model": args.judge_model or args.model,
                 "top_k": DEFAULT_TOP_K,
@@ -1880,6 +1931,9 @@ def main():
 
     print(f"\n  Results saved to: {RESULTS_FILE}")
     print(f"  Summary saved to: {summary_file}")
+    if PAIRED_OUTCOMES_FILE.exists():
+        print(f"  Paired outcomes appended to: {PAIRED_OUTCOMES_FILE}")
+        print(f"    (filter by config_id={_config_id!r} for this run's rows)")
 
 
 if __name__ == "__main__":
