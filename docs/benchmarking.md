@@ -244,9 +244,11 @@ Capture into `results/beam_e2e_results.json` (or equivalent):
 - **Storage** — final row counts in `working_memory`, `episodic_memory`, `memory_embeddings`, `vec_episodes`, `annotations`, `consolidated_facts`.
 - **Peak RSS** during ingest and recall phases separately.
 
-For statistical reporting, also output a flat `paired_outcomes.jsonl` with `{config_id, question_id, ability, correct}` rows so bootstrap CIs on paired deltas can be computed without re-parsing the main results.
+For statistical reporting, the harness emits a flat `paired_outcomes.jsonl` alongside `beam_e2e_results.json`. Each row carries `{config_id, run_started_at, scale, conversation_id, qid, ability, score, correct}`. `config_id` is either supplied via `--config-id` (recommended for human-readable phase labels like `phase3a-no-fact-voice`) or auto-derived as a SHA-256 hash of the `MNEMOSYNE_*` env snapshot. `correct` is `score >= 0.5` (treating partial-credit as correct; analyst can re-threshold off raw `score`).
 
-The current harness does not yet emit the diagnostic snapshots or paired outcomes; wiring them in is tracked as Gap D + Gap E in the [BEAM-recovery experiment plan](experiments/2026-05-12-beam-recovery-arms-abc.md#implementation-gaps).
+Append-only: multiple A/B-phase runs accumulate in one file. Filter by `config_id` to isolate a single phase. The diagnostic snapshots are also emitted into `beam_e2e_results.json` under `metadata.diagnostics`.
+
+**Voice-score parity:** post-recall result dicts from both engines now carry a `voice_scores: dict` field for uniform analysis. Keys differ between engines (linear uses `{vec, fts, keyword, importance, recency_decay}`; polyphonic uses `{vector, graph, fact, temporal}`), so engine identity is the dict's keyset, not the field's presence.
 
 ---
 

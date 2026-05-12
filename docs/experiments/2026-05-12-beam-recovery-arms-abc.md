@@ -223,7 +223,7 @@ Add to `tools/evaluate_beam_end_to_end.py:main()` near argument parsing:
 
 Wire the harness to call `get_recall_diagnostics()` and `get_extraction_stats()` and write their JSON snapshots into `results/beam_e2e_results.json` per-conversation per-phase. Also call `reset_recall_diagnostics()` at the start of each phase to keep counters clean. The functions exist (PR #78 + #79); the harness simply doesn't use them.
 
-### Gap E — Per-question paired-outcome recording for CIs (~40 LOC)
+### Gap E — Per-question paired-outcome recording for CIs (~40 LOC) — ✅ closed
 
 Currently the harness writes per-question scores but doesn't structure them for paired statistical analysis. Add: for each (config, question) pair, record whether the answer was correct. Output a flat `paired_outcomes.jsonl` with `{config_id, question_id, ability, correct}` rows so a downstream notebook can bootstrap CIs without re-parsing the main results.
 
@@ -231,7 +231,7 @@ Currently the harness writes per-question scores but doesn't structure them for 
 
 Add a top-level file listing `numpy`, `datasets`, `sqlite-vec`, `fastembed`, optionally `llama-cpp-python` and `huggingface-hub`. Reference it from the README under "Running the BEAM benchmark." The current pyproject `[project.optional-dependencies]` groups (`llm`, `embeddings`, `mcp`, `all`) don't cover the benchmark-only deps (`numpy`, `datasets`, `sqlite-vec`).
 
-### Gap G — Voice-score capture in linear-path results (~20 LOC)
+### Gap G — Voice-score capture in linear-path results (~20 LOC) — ✅ closed
 
 The polyphonic results already carry `voice_scores: dict` per result dict (`beam.py:~2969`). Linear-path results don't — they have `dense_score`, `keyword_score`, `fts_score` separately but no unified provenance dict. For uniform post-hoc analysis ("which signal drove this row?"), add a similarly-shaped provenance dict to linear results too. Not strictly required to run the plan, but materially eases analysis. Defer if scope is tight.
 

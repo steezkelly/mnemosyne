@@ -3166,6 +3166,24 @@ class BeamMemory:
                     wm_veracity = r.get("veracity") or "unknown"
                     r["score"] *= veracity_map.get(wm_veracity, UNKNOWN_WEIGHT)
 
+        # Gap G: linear-path voice_scores parity with the polyphonic
+        # engine. Each result already carries per-signal fields
+        # (dense_score, fts_score, keyword_score) and ranking inputs
+        # (importance, recency_decay). Collapse them into a
+        # `voice_scores` dict so downstream analysis can treat linear
+        # + polyphonic results uniformly when computing per-signal
+        # contributions across arms. The polyphonic engine sets the
+        # same field at beam.py:~3544 — same contract, different keys
+        # because the engines have different signal sources.
+        for r in results:
+            r.setdefault("voice_scores", {
+                "vec": r.get("dense_score", 0.0),
+                "fts": r.get("fts_score", 0.0),
+                "keyword": r.get("keyword_score", 0.0),
+                "importance": r.get("importance", 0.0),
+                "recency_decay": r.get("recency_decay", 0.0),
+            })
+
         results.sort(key=lambda x: x["score"], reverse=True)
         # E3.a.3: collapse (episodic_summary, working_memory_source)
         # duplicates before top-K truncation and recall_count attribution.
