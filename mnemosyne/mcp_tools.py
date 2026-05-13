@@ -287,7 +287,8 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         importance=importance,
         metadata=metadata,
         extract_entities=extract_entities,
-        extract=extract
+        extract=extract,
+        trust_tier="EXTERNAL_WRITE",
     )
 
     return {
