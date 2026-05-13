@@ -222,7 +222,29 @@ def _on_pre_llm_call(session_id, history, **kwargs):
        using the user's last message as the query
 
     This provides both short-term continuity AND long-term memory recall.
+
+    C13: defers to ``MnemosyneMemoryProvider.prefetch()`` when the
+    canonical surface is active. Without this guard both paths fire on
+    every LLM call, injecting two memory-context blocks into the system
+    prompt -- doubling the per-turn token cost (each block runs its own
+    recall and writes its own header) and confusing the agent with two
+    differently-formatted views of similar content. The provider's
+    initialize() sets ``hermes_memory_provider._provider_active = True``
+    once it's the active surface; this hook reads that flag and returns
+    None (no context injected from this path). Standalone plugin-only
+    installs are unaffected -- the flag stays False and this hook runs
+    as before.
     """
+    try:
+        from hermes_memory_provider import _provider_active
+        if _provider_active:
+            return None
+    except ImportError:
+        # The MemoryProvider package isn't installed in this environment
+        # -- plugin-only install path. Fall through to the existing
+        # injection logic below.
+        pass
+
     try:
         mem_id = f"hermes_{session_id}" if session_id else "hermes_default"
         mem = _get_memory(session_id=mem_id)

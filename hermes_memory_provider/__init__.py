@@ -30,6 +30,40 @@ if str(_mnemosyne_root) not in sys.path:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# C13: provider-active flag for memory-context double-injection prevention.
+# ---------------------------------------------------------------------------
+# When Hermes loads BOTH the MemoryProvider (canonical surface) AND the
+# legacy hermes_plugin (composed by the provider's register() at line ~828,
+# or independently discovered when a plugin.yaml is found), TWO pre-turn
+# memory-injection paths fire on every LLM call:
+#   1. MnemosyneMemoryProvider.prefetch() renders a `## Mnemosyne Context`
+#      block.
+#   2. hermes_plugin._on_pre_llm_call() renders a `MNEMOSYNE CONTEXT /
+#      MNEMOSYNE RECALL` block.
+# Both run their own beam.recall() and write to the system prompt, doubling
+# the per-turn token cost and confusing the agent with duplicated context.
+#
+# Fix: when at least one MemoryProvider instance is the active surface (its
+# initialize() ran successfully in a non-skip context), the plugin's
+# _on_pre_llm_call() defers via the ``_provider_active`` flag below. The
+# flag is the boolean view of an instance refcount so:
+#   - Multiple provider instances coexisting in one process all keep the
+#     flag True until ALL of them shut down (codex review #3 -- a single
+#     bool can't represent multi-instance lifecycle).
+#   - Skip-context re-init of an already-active instance DEACTIVATES it
+#     (codex review #2 -- otherwise a primary->subagent re-init silences
+#     the plugin for the subagent session, breaking legacy plugin behavior
+#     for skip contexts).
+#   - Init FAILURE keeps the flag at whatever it was -- if init fails,
+#     this instance never activated, so the plugin path remains available
+#     as the legacy fallback (codex review #1 -- without C27 merged here,
+#     the provider's system_prompt_block returns "" on init failure;
+#     suppressing the plugin too would leave a failed install completely
+#     invisible).
+_provider_active: bool = False
+_active_provider_count: int = 0
+
+# ---------------------------------------------------------------------------
 # Lazy imports — fail gracefully if mnemosyne core is missing
 # ---------------------------------------------------------------------------
 
@@ -247,6 +281,34 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # daemon thread from racing with unregister and falling through to
         # MNEMOSYNE_LLM_BASE_URL.
         self._session_end_thread: Optional[threading.Thread] = None
+        # C13: per-instance tracking of whether THIS provider contributed
+        # to the module-level _active_provider_count. Lets each instance
+        # increment exactly once on activate and decrement exactly once on
+        # deactivate, even across re-init cycles, without producing a
+        # negative count when shutdown is called on a never-activated
+        # instance.
+        self._is_active_in_module: bool = False
+
+    def _activate_in_module(self) -> None:
+        """Bump the module-level active-provider count exactly once per
+        instance lifecycle. Called when this instance transitions into
+        the active state (non-skip-context initialize completed)."""
+        global _active_provider_count, _provider_active
+        if not self._is_active_in_module:
+            self._is_active_in_module = True
+            _active_provider_count += 1
+            _provider_active = True
+
+    def _deactivate_in_module(self) -> None:
+        """Drop this instance from the module-level active-provider
+        count. Idempotent -- a never-activated instance is a no-op.
+        ``_provider_active`` stays True as long as ANY other instance is
+        still active (multi-instance refcount semantics)."""
+        global _active_provider_count, _provider_active
+        if self._is_active_in_module:
+            self._is_active_in_module = False
+            _active_provider_count = max(0, _active_provider_count - 1)
+            _provider_active = (_active_provider_count > 0)
 
     @property
     def name(self) -> str:
@@ -434,6 +496,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
         if self._agent_context in self._skip_contexts:
             logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
+            # C13: a skip-context re-init must DEACTIVATE the instance if
+            # it was previously active in this process. Without this, a
+            # primary -> subagent re-init keeps _provider_active=True and
+            # silences the legacy plugin's pre_llm_call for the subagent
+            # session -- which the plugin used to handle (it has no
+            # skip-context check of its own). Preserving legacy behavior
+            # for the plugin in skip contexts is the smaller blast radius
+            # vs. silently dropping memory injection for those sessions.
+            self._deactivate_in_module()
             return
 
         self._session_id = f"hermes_{session_id}"
@@ -462,6 +533,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
+
+        # C13: activate AFTER the BeamMemory init result is known. If
+        # init succeeded (_beam is set) the provider is the live memory
+        # surface and the plugin path should defer. If init FAILED the
+        # provider can't serve prefetch() / handle_tool_call() either,
+        # so leaving the plugin's pre_llm_call enabled preserves a
+        # legacy fallback that at least keeps the agent's memory
+        # surface functional rather than silently breaking both paths.
+        # Once C27 (provider-init-error-visible) merges, this fallback
+        # becomes redundant -- but until then it's the conservative
+        # choice (codex review #1).
+        if self._beam is not None:
+            self._activate_in_module()
 
         # Register the Hermes auxiliary LLM backend so Mnemosyne can route
         # consolidation and fact extraction through Hermes' authenticated
@@ -791,6 +875,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
         self._beam = None
+
+        # C13: decrement this instance's contribution to the module-level
+        # active-provider count. ``_provider_active`` stays True if other
+        # provider instances are still active in the process (codex
+        # review #3 -- a single shared bool can't represent multi-
+        # instance lifecycle).
+        self._deactivate_in_module()
 
 
 # ---------------------------------------------------------------------------
