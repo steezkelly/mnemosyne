@@ -1340,6 +1340,17 @@ class BeamMemory:
         self.author_id = author_id
         self.author_type = author_type
         self.channel_id = channel_id or session_id  # default channel = session
+        # Coerce path-like inputs (e.g. tempfile-produced strings) to a
+        # Path so downstream consumers like _get_connection that do
+        # `path.parent.mkdir(...)` don't blow up with
+        # ``AttributeError: 'str' object has no attribute 'parent'``.
+        # The previous contract was implicit (Path-only); making it
+        # explicit here is backward-compatible -- a real Path stays a
+        # Path -- and unbreaks every caller that passes a string,
+        # including the test_identity_memory.py fixtures added by
+        # PR #106 which now run on every PR's CI matrix.
+        if db_path is not None and not isinstance(db_path, Path):
+            db_path = Path(db_path)
         self.db_path = db_path or _default_db_path()
         self.use_cloud = use_cloud  # Enable LLM fact extraction during remember()
         self._extraction_client = None  # Lazy-loaded ExtractionClient

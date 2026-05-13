@@ -26,8 +26,12 @@ class TestIdentitySignals:
             provider._auto_sleep_enabled = False
 
             from mnemosyne.core.beam import BeamMemory
+            # BeamMemory has no separate initialize() method -- __init__
+            # already opens the connection and runs init_beam() (schema
+            # setup, sleep_log, etc.). The previous beam.initialize()
+            # call raised AttributeError, breaking this fixture on every
+            # PR's CI run. Drop it; __init__ is sufficient.
             beam = BeamMemory(db_path=db_path)
-            beam.initialize()
             provider._beam = beam
 
             yield provider
