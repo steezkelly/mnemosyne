@@ -272,29 +272,34 @@ class TestSleepCycle:
 
         # Post-sleep, exactly one episodic row should exist (one consolidated
         # summary for the session). Dense store should hold a row for it.
+        #
+        # Use ``beam.conn`` rather than a fresh ``sqlite3.connect`` for the
+        # check: when sqlite-vec is installed, the extension is loaded on
+        # beam.conn (where the writes happened) but NOT on a freshly-opened
+        # connection. Reading vec_episodes through a fresh connection would
+        # raise "no such table" and steer us into the wrong assertion
+        # branch. beam.conn is the authoritative reader for this state.
         from mnemosyne.core.beam import _vec_available
 
-        conn = sqlite3.connect(temp_db)
-        ep_ids = [r[0] for r in conn.execute("SELECT id FROM episodic_memory").fetchall()]
+        bc = beam.conn
+        ep_ids = [r[0] for r in bc.execute("SELECT id FROM episodic_memory").fetchall()]
         assert len(ep_ids) == 1, f"expected 1 consolidated episodic row, got {len(ep_ids)}"
 
-        if _vec_available(conn):
-            vec_count = conn.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
-            conn.close()
+        if _vec_available(bc):
+            vec_count = bc.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
             assert vec_count >= 1, (
                 "sleep consolidated an episodic row but vec_episodes is "
-                "empty — the embed→_vec_insert path did not run. Likely "
+                "empty -- the embed->_vec_insert path did not run. Likely "
                 "cause: _embeddings.embed() returned None silently, or "
                 "_vec_insert raised and was swallowed."
             )
         else:
-            mem_count = conn.execute(
+            mem_count = bc.execute(
                 "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (ep_ids[0],)
             ).fetchone()[0]
-            conn.close()
             assert mem_count >= 1, (
                 "sleep consolidated an episodic row but memory_embeddings "
-                "fallback is empty — the embed→INSERT path did not run."
+                "fallback is empty -- the embed->INSERT path did not run."
             )
 
     def test_sleep_consolidated_content_is_recallable(self, temp_db, monkeypatch):
