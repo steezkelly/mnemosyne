@@ -4465,6 +4465,23 @@ class BeamMemory:
             summary = None
             llm_succeeded = False
             if local_llm.llm_available():
+                # --- Optional pre-compression for small local LLMs ---
+                if os.environ.get("MNEMOSYNE_USE_CAVEMAN", "").lower() in ("1", "true", "yes"):
+                    try:
+                        from rust_cave_001 import compress
+                        compressed = []
+                        for line in lines:
+                            try:
+                                c = compress(line)
+                                compressed.append(c if len(c) > 2 else line)
+                            except Exception:
+                                compressed.append(line)
+                        lines = compressed
+                    except ImportError:
+                        pass  # rust_cave_001 not installed, skip gracefully
+                    except Exception:
+                        pass  # Compression failed non-fatally, use original lines
+
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
                     if len(chunks) == 1:
