@@ -629,6 +629,7 @@ Importers preserve source metadata where available. `HindsightImporter` uses a d
 | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Recency decay halflife in hours (1 week) |
 | `MNEMOSYNE_EP_LIMIT` | `50000` | Episodic memory recall limit |
 | `MNEMOSYNE_SLEEP_BATCH` | `5000` | Max working memories to fetch for consolidation |
+| `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory character limit for Hermes provider prefetch injection; `0` disables truncation |
 
 ### Local LLM (ctransformers/GGUF)
 
