@@ -31,7 +31,7 @@ ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
     "assistant", "user", "skill", "review", "target", "class",
     "level", "signals", "phase", "api", "pi", "summary", "added",
     "active", "be", "not", "whether", "all", "no", "replying",
-    "ai", "memory", "mnemosyne", "conversation", "fact",
+    "ai", "memory", "conversation", "fact",
     "false", "true", "none", "null", "signal",
     "hermes", "assistant", "agent", "model", "system", "memory",
     "note", "task", "project", "result", "output", "input", "data",
