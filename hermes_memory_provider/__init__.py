@@ -79,6 +79,42 @@ def _get_triple_module():
     return add_triple, query_triples
 
 
+def _prefetch_content_char_limit() -> int:
+    """Return the per-memory prefetch content limit.
+
+    ``0`` means no truncation. This is the default because the old hardcoded
+    200-character cap often removed the actual fact from LLM-authored memories.
+    Operators that need tighter prompt budgets can set
+    ``MNEMOSYNE_PREFETCH_CONTENT_CHARS`` to a positive integer.
+    """
+    raw = os.environ.get("MNEMOSYNE_PREFETCH_CONTENT_CHARS", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_PREFETCH_CONTENT_CHARS=%r; disabling prefetch truncation",
+            raw,
+        )
+        return 0
+
+
+def _format_prefetch_content(content: str, limit: int) -> str:
+    """Format recalled memory content for prompt injection.
+
+    When a positive limit is configured, truncate on a word boundary instead of
+    splitting mid-token. Without a positive limit, return the complete content.
+    """
+    if limit <= 0 or len(content) <= limit:
+        return content
+
+    cut = content[:limit].rstrip()
+    # Prefer a word boundary when one exists reasonably close to the limit.
+    boundary = cut.rfind(" ")
+    if boundary >= max(1, limit // 2):
+        cut = cut[:boundary].rstrip()
+    return f"{cut}..."
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -848,10 +884,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
+            content_limit = _prefetch_content_char_limit()
             for r in filtered:
-                content = r.get("content", "")[:200]
-                if len(r.get("content", "")) > 200:
-                    content += "..."
+                content = _format_prefetch_content(
+                    r.get("content", ""),
+                    content_limit,
+                )
                 ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
                 imp = r.get("importance", 0.0)
                 trust = r.get("trust_tier", "STATED")
